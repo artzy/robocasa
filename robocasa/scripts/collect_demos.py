@@ -36,6 +36,12 @@ from robocasa.wrappers.enclosing_wall_render_wrapper import (
     EnclosingWallHotkeyHandler,
     install_enclosing_wall_hotkeys,
 )
+from robocasa.utils.playback_viewer import (
+    PygamePlaybackViewer,
+    onscreen_renderer_name,
+    render_onscreen,
+    robosuite_viewer_kwargs,
+)
 
 
 def is_empty_input_spacemouse(action_dict):
@@ -58,6 +64,7 @@ def collect_human_trajectory(
     render=True,
     max_fr=None,
     print_info=True,
+    pygame_viewer=None,
 ):
     """
     Use the device (keyboard or SpaceNav 3D mouse) to collect a demonstration.
@@ -84,8 +91,7 @@ def collect_human_trajectory(
     # return None, True
 
     if render:
-        # ID = 2 always corresponds to agentview
-        env.render()
+        render_onscreen(env, pygame_viewer)
 
     task_completion_hold_count = (
         -1
@@ -151,7 +157,7 @@ def collect_human_trajectory(
         if is_empty_input_spacemouse(action_dict):
             if not nonzero_ac_seen:
                 if render:
-                    env.render()
+                    render_onscreen(env, pygame_viewer)
                 continue
         else:
             nonzero_ac_seen = True
@@ -167,7 +173,7 @@ def collect_human_trajectory(
         # Run environment step
         obs, _, _, _ = env.step(env_action)
         if render:
-            env.render()
+            render_onscreen(env, pygame_viewer)
 
         # Also break if we complete the task
         if task_completion_hold_count == 0:
@@ -484,17 +490,40 @@ if __name__ == "__main__":
     config["translucent_robot"] = True
     mirror_actions = True
 
+    if args.renderer == "mjviewer":
+        onscreen_renderer = onscreen_renderer_name()
+    else:
+        onscreen_renderer = args.renderer
+    onscreen_renderer, viewer_kwargs = robosuite_viewer_kwargs(
+        onscreen_renderer=onscreen_renderer,
+        render_camera=args.camera,
+    )
+
     # Create environment
     env = robosuite.make(
         **config,
-        has_renderer=True,
-        has_offscreen_renderer=False,
-        render_camera=args.camera,
+        has_renderer=viewer_kwargs["has_renderer"],
+        has_offscreen_renderer=viewer_kwargs["has_offscreen_renderer"],
         ignore_done=True,
         use_camera_obs=False,
         control_freq=20,
-        renderer=args.renderer,
+        renderer=viewer_kwargs["renderer"],
+        **(
+            {"render_camera": viewer_kwargs["render_camera"]}
+            if "render_camera" in viewer_kwargs
+            else {}
+        ),
     )
+
+    pygame_viewer = None
+    if onscreen_renderer == "pygame" and args.camera is not None:
+        pygame_viewer = PygamePlaybackViewer(
+            camera_name=args.camera,
+            width=768,
+            height=512,
+            title="RoboCasa Collect",
+        )
+        print(colored("Opening viewer (pygame window)...", "yellow"))
 
     # Wrap this with visualization wrapper
     env = VisualizationWrapper(env)
@@ -521,6 +550,8 @@ if __name__ == "__main__":
 
     # Esc toggles wall transparency; '[' / ']' force it OFF (also mjviewer camera keys).
     install_enclosing_wall_hotkeys(env)
+    if pygame_viewer is not None:
+        env._pygame_viewer = pygame_viewer
 
     # initialize device
     device = args.device
@@ -570,8 +601,9 @@ if __name__ == "__main__":
                 args.arm,
                 args.config,
                 mirror_actions,
-                render=(args.renderer != "mjviewer"),
+                render=(onscreen_renderer != "mjviewer"),
                 max_fr=args.max_fr,
+                pygame_viewer=pygame_viewer,
             )
             if ep_directory is not None:
                 # save whether the episode is successful or not

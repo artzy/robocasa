@@ -8,6 +8,7 @@ from robosuite.wrappers import Wrapper
 from pynput.keyboard import Key, Listener
 
 import robocasa.models.scenes.scene_registry as SceneRegistry
+from robocasa.utils.playback_viewer import find_pygame_viewer, render_onscreen
 
 
 def _unwrap_env(env):
@@ -42,11 +43,15 @@ def _refresh_visualization_and_redraw(env, *, render: bool):
         env.visualize(vis_settings)
 
     # Force a redraw without stepping
-    viewer = getattr(env, "viewer", None)
-    if viewer is not None:
-        viewer.update()
-    elif render and hasattr(env, "render"):
-        env.render()
+    pygame_viewer = find_pygame_viewer(env)
+    if pygame_viewer is not None:
+        render_onscreen(env, pygame_viewer)
+    else:
+        viewer = getattr(env, "viewer", None)
+        if viewer is not None:
+            viewer.update()
+        elif render and hasattr(env, "render"):
+            env.render()
 
 
 class EnclosingWallHotkeyHandler:

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
 import h5py
 import imageio
@@ -17,6 +18,7 @@ import robocasa.utils.lerobot_utils as LU
 from robocasa.scripts.dataset_scripts.playback_utils import (
     resolve_instruction_from_ep_meta,
 )
+from robocasa.utils.playback_viewer import PygamePlaybackViewer, onscreen_renderer_name
 
 
 def playback_trajectory_with_env(
@@ -32,6 +34,8 @@ def playback_trajectory_with_env(
     verbose=False,
     camera_height=512,
     camera_width=512,
+    onscreen_camera="robot0_agentview_center",
+    onscreen_renderer="mjviewer",
 ):
     """
     Helper function to playback a single trajectory using the simulator environment.
@@ -78,11 +82,35 @@ def playback_trajectory_with_env(
             states.shape[0], actions.shape[0]
         )
 
-    if render is False:
+    pygame_viewer = None
+    if render and onscreen_renderer == "pygame":
+        pygame_viewer = PygamePlaybackViewer(
+            camera_name=onscreen_camera,
+            width=camera_width,
+            height=camera_height,
+            title="RoboCasa",
+        )
+
+    if render:
+        if onscreen_renderer == "pygame":
+            print(colored("Opening viewer (pygame window)...", "yellow"))
+        elif onscreen_renderer == "mujoco":
+            print(colored("Opening viewer (OpenCV window)...", "yellow"))
+        else:
+            print(
+                colored(
+                    "Opening MuJoCo viewer... (check taskbar if the window is hidden)",
+                    "yellow",
+                )
+            )
+    else:
         print(colored("Running episode...", "yellow"))
 
     for t in range(traj_len):
         start = time.time()
+
+        if render and pygame_viewer is not None and not pygame_viewer.pump_events():
+            break
 
         if action_playback:
             env.step(actions[t])
@@ -105,11 +133,15 @@ def playback_trajectory_with_env(
 
         # on-screen render
         if render:
-            if env.viewer is None:
-                env.initialize_renderer()
-
-            # so that mujoco viewer renders
-            env.viewer.update()
+            if pygame_viewer is not None:
+                if not pygame_viewer.update(env.sim):
+                    break
+            elif env.renderer == "mjviewer":
+                if env.viewer is None:
+                    env.initialize_renderer()
+                env.viewer.update()
+            else:
+                env.render()
 
             max_fr = 60
             elapsed = time.time() - start
@@ -138,8 +170,25 @@ def playback_trajectory_with_env(
             break
 
     if render:
-        env.viewer.close()
-        env.viewer = None
+        print(colored("Playback finished.", "green"))
+        if pygame_viewer is not None:
+            print(
+                colored(
+                    "Close the window, press Esc/Enter in the viewer, "
+                    "or press Enter in the terminal.",
+                    "green",
+                )
+            )
+            pygame_viewer.wait_until_closed(env.sim)
+            pygame_viewer.close()
+        else:
+            try:
+                input("Press Enter to close the viewer...")
+            except EOFError:
+                pass
+            if env.viewer is not None:
+                env.viewer.close()
+                env.viewer = None
 
 
 class ObservationKeyToModalityDict(dict):
@@ -285,10 +334,24 @@ def playback_dataset(
 
         env_kwargs = env_meta["env_kwargs"]
         env_kwargs["env_name"] = env_meta["env_name"]
-        env_kwargs["has_renderer"] = False
-        env_kwargs["renderer"] = "mjviewer"
-        env_kwargs["has_offscreen_renderer"] = write_video
+        onscreen_renderer = onscreen_renderer_name() if render else "mjviewer"
+        env_kwargs["has_renderer"] = render and onscreen_renderer == "mujoco"
+        env_kwargs["renderer"] = (
+            onscreen_renderer if onscreen_renderer != "pygame" else "mjviewer"
+        )
+        env_kwargs["has_offscreen_renderer"] = write_video or (
+            render and onscreen_renderer in ("mujoco", "pygame")
+        )
         env_kwargs["use_camera_obs"] = False
+        cam = (
+            render_image_names[0]
+            if render_image_names
+            else "robot0_agentview_center"
+        )
+        if render and onscreen_renderer == "mujoco":
+            env_kwargs["render_camera"] = cam
+        elif render:
+            env_kwargs["render_camera"] = None
 
         if verbose:
             print(
@@ -299,6 +362,7 @@ def playback_dataset(
             )
 
         env = robosuite.make(**env_kwargs)
+        env._playback_onscreen_renderer = onscreen_renderer
 
     assert filter_key is None, "filter_key not supported for lerobot dataset format"
     demos = LU.get_episodes(dataset)
@@ -346,6 +410,8 @@ def playback_dataset(
             verbose=verbose,
             camera_height=camera_height,
             camera_width=camera_width,
+            onscreen_camera=cam if render else "robot0_agentview_center",
+            onscreen_renderer=onscreen_renderer if render else "mjviewer",
         )
 
     if write_video:

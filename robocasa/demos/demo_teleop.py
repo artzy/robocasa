@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 import time
 from collections import OrderedDict
 
@@ -13,6 +14,10 @@ from robocasa.scripts.collect_demos import collect_human_trajectory
 from robocasa.wrappers.enclosing_wall_render_wrapper import (
     EnclosingWallRenderWrapper,
     install_enclosing_wall_hotkeys,
+)
+from robocasa.utils.playback_viewer import (
+    PygamePlaybackViewer,
+    robosuite_viewer_kwargs,
 )
 
 
@@ -114,24 +119,42 @@ if __name__ == "__main__":
         "translucent_robot": True,
     }
 
-    args.renderer = "mjviewer"
+    onscreen_renderer, viewer_kwargs = robosuite_viewer_kwargs(
+        render_camera="robot0_frontview"
+    )
 
     print(colored(f"Initializing environment...", "yellow"))
     env = robosuite.make(
         **config,
-        has_renderer=True,
-        has_offscreen_renderer=False,
-        render_camera="robot0_frontview",
+        has_renderer=viewer_kwargs["has_renderer"],
+        has_offscreen_renderer=viewer_kwargs["has_offscreen_renderer"],
         ignore_done=True,
         use_camera_obs=False,
         control_freq=20,
-        renderer=args.renderer,
+        renderer=viewer_kwargs["renderer"],
+        **(
+            {"render_camera": viewer_kwargs["render_camera"]}
+            if "render_camera" in viewer_kwargs
+            else {}
+        ),
     )
+
+    pygame_viewer = None
+    if onscreen_renderer == "pygame":
+        pygame_viewer = PygamePlaybackViewer(
+            camera_name="robot0_frontview",
+            width=768,
+            height=512,
+            title="RoboCasa Teleop",
+        )
+        print(colored("Opening viewer (pygame window)...", "yellow"))
 
     # Wrap this with visualization wrapper
     env = VisualizationWrapper(env)
     env = EnclosingWallRenderWrapper(env, alpha=0.1, enabled=False)
     install_enclosing_wall_hotkeys(env)
+    if pygame_viewer is not None:
+        env._pygame_viewer = pygame_viewer
 
     # Grab reference to controller config and convert it to json-encoded string
     env_info = json.dumps(config)
@@ -163,7 +186,8 @@ if __name__ == "__main__":
             "right",
             "single-arm-opposed",
             mirror_actions=True,
-            render=(args.renderer != "mjviewer"),
+            render=(onscreen_renderer != "mjviewer"),
             max_fr=30,
+            pygame_viewer=pygame_viewer,
         )
         print()

@@ -1235,7 +1235,13 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         textures = asset.findall("texture")
         all_elements = meshes + textures
 
-        robocasa_path_split = os.path.split(robocasa.__file__)[0].split("/")
+        robocasa_root = os.path.dirname(robocasa.__file__)
+        asset_markers = (
+            "models/assets/fixtures",
+            "models/assets/textures",
+            "models/assets/objects",
+            "models/assets/generative_textures",
+        )
 
         # replace robocasa-specific asset paths
         for elem in all_elements:
@@ -1243,34 +1249,20 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
             if old_path is None:
                 continue
 
-            old_path_split = old_path.split("/")
-            # maybe replace all paths to robosuite assets
-            if (
-                ("models/assets/fixtures" in old_path)
-                or ("models/assets/textures" in old_path)
-                or ("models/assets/objects" in old_path)
-                or ("models/assets/generative_textures" in old_path)
-            ):
-                if "/robosuite/" in old_path:
-                    check_lst = [
-                        loc
-                        for loc, val in enumerate(old_path_split)
-                        if val == "robosuite"
-                    ]
-                elif "/robocasa/" in old_path:
-                    check_lst = [
-                        loc
-                        for loc, val in enumerate(old_path_split)
-                        if val == "robocasa"
-                    ]
-                else:
-                    raise ValueError
+            old_path_norm = old_path.replace("\\", "/")
+            if not any(marker in old_path_norm for marker in asset_markers):
+                continue
 
-                ind = max(check_lst)  # last occurrence index
-                new_path_split = robocasa_path_split + old_path_split[ind + 1 :]
+            if "robocasa/" not in old_path_norm:
+                continue
 
-                new_path = "/".join(new_path_split)
-                elem.set("file", new_path)
+            marker_idx = old_path_norm.find("models/assets/")
+            if marker_idx == -1:
+                continue
+
+            suffix = old_path_norm[marker_idx:]
+            new_path = os.path.join(robocasa_root, *suffix.split("/"))
+            elem.set("file", new_path.replace("\\", "/"))
 
         # set cameras
         for cam_name, cam_config in self._cam_configs.items():
