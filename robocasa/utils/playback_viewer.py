@@ -1,5 +1,7 @@
 """On-screen playback viewer for platforms without OpenCV GUI (e.g. Windows + headless cv2)."""
 
+from __future__ import annotations
+
 import sys
 
 import numpy as np
@@ -36,6 +38,55 @@ def _stdin_ready():
     return False
 
 
+def resolve_layout_id(env):
+    cur = env
+    while cur is not None:
+        layout_id = getattr(cur, "layout_id", None)
+        if layout_id is not None:
+            return layout_id
+        cur = getattr(cur, "env", None)
+    return None
+
+
+def get_layout_camera_config(env):
+    from robocasa.utils import camera_utils as CamUtils
+
+    layout_id = resolve_layout_id(env)
+    return dict(CamUtils.LAYOUT_CAMS.get(layout_id, CamUtils.DEFAULT_LAYOUT_CAM))
+
+
+def render_free_camera(sim, width, height, cam_config):
+    import mujoco
+
+    ctx = sim._render_context_offscreen
+    if ctx is None:
+        raise RuntimeError("offscreen renderer is required for free-camera rendering")
+
+    ctx.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    ctx.cam.lookat[:] = cam_config["lookat"]
+    ctx.cam.distance = float(cam_config["distance"])
+    ctx.cam.azimuth = float(cam_config["azimuth"])
+    ctx.cam.elevation = float(cam_config["elevation"])
+    ctx.render(width=width, height=height, camera_id=-1)
+    frame = ctx.read_pixels(width, height)
+    return np.ascontiguousarray(frame)
+
+
+def apply_mjviewer_camera_config(env, cam_config):
+    viewer = getattr(env, "viewer", None)
+    if viewer is None:
+        return
+    viewer.camera_config = dict(cam_config)
+    passive = getattr(viewer, "viewer", None)
+    if passive is None:
+        return
+    passive.cam.lookat[:] = cam_config["lookat"]
+    passive.cam.distance = float(cam_config["distance"])
+    passive.cam.azimuth = float(cam_config["azimuth"])
+    passive.cam.elevation = float(cam_config["elevation"])
+    passive.cam.type = 0
+
+
 class PygamePlaybackViewer:
     def __init__(
         self,
@@ -43,12 +94,14 @@ class PygamePlaybackViewer:
         width=768,
         height=512,
         title="RoboCasa",
+        free_cam_config=None,
     ):
         import pygame
 
         pygame.init()
         self._pygame = pygame
         self.camera_name = camera_name
+        self.free_cam_config = free_cam_config
         self.width = width
         self.height = height
         self.screen = pygame.display.set_mode((width, height))
@@ -81,11 +134,16 @@ class PygamePlaybackViewer:
         if self._should_close:
             return False
 
-        frame = sim.render(
-            camera_name=self.camera_name,
-            width=self.width,
-            height=self.height,
-        )
+        if self.free_cam_config is not None:
+            frame = render_free_camera(
+                sim, self.width, self.height, self.free_cam_config
+            )
+        else:
+            frame = sim.render(
+                camera_name=self.camera_name,
+                width=self.width,
+                height=self.height,
+            )
         frame = np.ascontiguousarray(np.flipud(frame))
         surf = self._pygame.image.frombuffer(
             frame.tobytes(), (self.width, self.height), "RGB"

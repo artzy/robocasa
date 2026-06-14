@@ -23,6 +23,10 @@ from robocasa.scripts.collect_demos import collect_human_trajectory
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 from robocasa.utils.playback_viewer import (
     PygamePlaybackViewer,
+    apply_mjviewer_camera_config,
+    get_layout_camera_config,
+    onscreen_renderer_name,
+    render_free_camera,
     robosuite_viewer_kwargs,
 )
 from robocasa.wrappers.enclosing_wall_render_wrapper import (
@@ -30,7 +34,6 @@ from robocasa.wrappers.enclosing_wall_render_wrapper import (
     install_enclosing_wall_hotkeys,
 )
 
-CAMERA_NAME_PREVIEW = "robot0_agentview_center"
 CAMERA_NAME_TELEOP = "robot0_frontview"
 CAMERA_WIDTH = 768
 CAMERA_HEIGHT = 512
@@ -39,12 +42,17 @@ PREVIEW_FPS = 20
 PREVIEW_DEFAULT_LAYOUT = 15
 PREVIEW_DEFAULT_STYLE = 34
 PREVIEW_DEFAULT_SEED = 0
+PREVIEW_MAX_CAMERA_DISTANCE = 5.0
 
 GRASP_Z_OFFSET = 0.03
 APPROACH_Z = 0.12
 LIFT_Z = 0.15
 PLACE_Z = 0.05
 RETREAT_Z = 0.12
+# Pan center relative to gripper site in EEF frame (meters).
+GRASP_LOCAL_OFFSET = np.array([0.0, 0.0, -0.08])
+GRASP_ATTACH_GRIPPER = 0.85
+MAX_PAN_EEF_ATTACH_DIST = 0.12
 
 PHASE_HOLD_START = 15
 PHASE_APPROACH = 20
@@ -79,6 +87,22 @@ def _preview_env_defaults(
     )
 
 
+def _compute_preview_cam_config(env):
+    """Layout overview camera centered on source→target pan motion."""
+    config = get_layout_camera_config(env)
+    try:
+        start_pan, start_quat = _get_pan_pose(env)
+        end_pan, _ = _compute_target_pan_pose(env, start_pan, start_quat)
+        config["lookat"] = ((start_pan + end_pan) / 2.0).tolist()
+    except Exception:
+        pass
+    # Offscreen free-camera rendering breaks above ~5.5m (blank gray frame on Windows/pygame).
+    config["distance"] = min(
+        float(config["distance"]), PREVIEW_MAX_CAMERA_DISTANCE
+    )
+    return config
+
+
 def make_move_pan_env(
     source_fixture: str = "counter",
     target_fixture: str = "sink",
@@ -92,7 +116,6 @@ def make_move_pan_env(
 ):
     """Create MovePan env with optional pygame viewer."""
     layout, style, seed = _preview_env_defaults(teleop, layout, style, seed)
-    camera_name = CAMERA_NAME_TELEOP if teleop else CAMERA_NAME_PREVIEW
     config = {
         "env_name": "MovePan",
         "robots": "PandaOmron",
@@ -106,6 +129,7 @@ def make_move_pan_env(
         "seed": seed,
     }
 
+    render_camera_kw = {}
     if render_offscreen:
         viewer_kwargs = {
             "has_renderer": False,
@@ -114,17 +138,37 @@ def make_move_pan_env(
         }
         onscreen_renderer = "offscreen"
         pygame_viewer = None
-    else:
+        render_camera_kw = {"render_camera": None}
+    elif teleop:
         onscreen_renderer, viewer_kwargs = robosuite_viewer_kwargs(
-            render_camera=camera_name
+            render_camera=CAMERA_NAME_TELEOP
         )
         pygame_viewer = None
         if onscreen_renderer == "pygame":
             pygame_viewer = PygamePlaybackViewer(
-                camera_name=camera_name,
+                camera_name=CAMERA_NAME_TELEOP,
                 width=CAMERA_WIDTH,
                 height=CAMERA_HEIGHT,
-                title="RoboCasa Teleop" if teleop else "RoboCasa",
+                title="RoboCasa Teleop",
+            )
+        if "render_camera" in viewer_kwargs:
+            render_camera_kw = {"render_camera": viewer_kwargs["render_camera"]}
+    else:
+        # Preview uses a kitchen overview free camera so counter→sink motion stays in frame.
+        onscreen_renderer = "mjviewer"
+        viewer_kwargs = {
+            "has_renderer": False,
+            "has_offscreen_renderer": True,
+            "renderer": "mjviewer",
+        }
+        render_camera_kw = {"render_camera": None}
+        pygame_viewer = None
+        if onscreen_renderer_name() == "pygame":
+            onscreen_renderer = "pygame"
+            pygame_viewer = PygamePlaybackViewer(
+                width=CAMERA_WIDTH,
+                height=CAMERA_HEIGHT,
+                title="RoboCasa",
             )
 
     print(colored("Initializing MovePan environment...", "yellow"))
@@ -136,11 +180,7 @@ def make_move_pan_env(
         use_camera_obs=False,
         control_freq=20,
         renderer=viewer_kwargs["renderer"],
-        **(
-            {"render_camera": viewer_kwargs["render_camera"]}
-            if "render_camera" in viewer_kwargs
-            else {}
-        ),
+        **render_camera_kw,
     )
 
     if pygame_viewer is not None:
@@ -231,7 +271,21 @@ def _get_eef_pose(env):
     mat = env.sim.data.site_xmat[site_id].reshape(3, 3)
     quat_xyzw = T.mat2quat(mat)
     quat = T.convert_quat(quat_xyzw, to="wxyz")
-    return pos, quat
+    return pos, quat, mat
+
+
+def _eef_local_to_world(eef_pos: np.ndarray, eef_mat: np.ndarray, local_offset: np.ndarray):
+    return eef_pos + eef_mat @ local_offset
+
+
+def _snap_pan_to_gripper(env, pan_quat: np.ndarray, local_offset: np.ndarray | None = None):
+    """Place pan at a fixed offset from the gripper site (grasp snap)."""
+    if local_offset is None:
+        local_offset = GRASP_LOCAL_OFFSET.copy()
+    eef_pos, _, eef_mat = _get_eef_pose(env)
+    pan_pos = _eef_local_to_world(eef_pos, eef_mat, local_offset)
+    _set_pan_pose(env, pan_pos, pan_quat)
+    return local_offset.copy()
 
 
 def _arm_qpos_indices(env):
@@ -374,13 +428,14 @@ def _build_move_pan_timeline(
 
     for i in range(PHASE_DESCEND):
         t = (i + 1) / PHASE_DESCEND
+        gripper = _lerp_scalar(0.0, 1.0, t)
         add_frame(
             eef_pos=_lerp_vec(approach_target, descend_target, t),
             eef_quat=home_eef_quat.copy(),
-            gripper=_lerp_scalar(0.0, 1.0, t),
+            gripper=gripper,
             pan_pos=start_pan.copy(),
             pan_quat=start_quat.copy(),
-            attach=False,
+            attach=gripper >= GRASP_ATTACH_GRIPPER,
         )
 
     for i in range(PHASE_LIFT):
@@ -445,7 +500,7 @@ def _apply_preview_frame(
     frame: _PreviewFrame,
     *,
     open_gripper_qpos: np.ndarray,
-    pan_offset: np.ndarray | None,
+    pan_local_offset: np.ndarray | None,
     ik_warned: list[bool],
     degraded: list[bool],
 ) -> np.ndarray | None:
@@ -464,21 +519,21 @@ def _apply_preview_frame(
     _set_gripper(env, frame.gripper, open_gripper_qpos)
 
     if frame.attach:
-        if pan_offset is None:
-            pan_pos, _ = _get_pan_pose(env)
-            eef_pos, _ = _get_eef_pose(env)
-            pan_offset = pan_pos - eef_pos
-        eef_pos, _ = _get_eef_pose(env)
-        _set_pan_pose(env, eef_pos + pan_offset, frame.pan_quat)
+        if pan_local_offset is None:
+            pan_local_offset = _snap_pan_to_gripper(env, frame.pan_quat)
+        else:
+            eef_pos, _, eef_mat = _get_eef_pose(env)
+            pan_pos = _eef_local_to_world(eef_pos, eef_mat, pan_local_offset)
+            _set_pan_pose(env, pan_pos, frame.pan_quat)
     else:
         _set_pan_pose(env, frame.pan_pos, frame.pan_quat)
         if frame.gripper < 0.05:
-            pan_offset = None
+            pan_local_offset = None
 
     env.sim.forward()
     if hasattr(env, "update_state"):
         env.update_state()
-    return pan_offset
+    return pan_local_offset
 
 
 def _generate_preview_states(env):
@@ -488,7 +543,7 @@ def _generate_preview_states(env):
 
     start_pan, start_quat = _get_pan_pose(env)
     end_pan, end_quat = _compute_target_pan_pose(env, start_pan, start_quat)
-    home_eef_pos, home_eef_quat = _get_eef_pose(env)
+    home_eef_pos, home_eef_quat, _ = _get_eef_pose(env)
     open_gripper_qpos = _resolve_robot(env).get_gripper_joint_positions("right").copy()
 
     timeline = _build_move_pan_timeline(
@@ -496,16 +551,16 @@ def _generate_preview_states(env):
     )
 
     states = []
-    pan_offset = None
+    pan_local_offset = None
     ik_warned = [False]
     degraded = [False]
 
     for frame in timeline:
-        pan_offset = _apply_preview_frame(
+        pan_local_offset = _apply_preview_frame(
             env,
             frame,
             open_gripper_qpos=open_gripper_qpos,
-            pan_offset=pan_offset,
+            pan_local_offset=pan_local_offset,
             ik_warned=ik_warned,
             degraded=degraded,
         )
@@ -528,7 +583,7 @@ def _play_state_sequence(
     *,
     pygame_viewer=None,
     video_writer=None,
-    camera_name=CAMERA_NAME_PREVIEW,
+    cam_config=None,
 ):
     print(colored("Playing back episode: MovePan scripted demo", "yellow"))
     for state in states:
@@ -542,15 +597,15 @@ def _play_state_sequence(
             if not pygame_viewer.update(env.sim):
                 break
         elif video_writer is not None:
-            frame = env.sim.render(
-                height=CAMERA_HEIGHT,
-                width=CAMERA_WIDTH,
-                camera_name=camera_name,
-            )[::-1]
+            frame = render_free_camera(
+                env.sim, CAMERA_WIDTH, CAMERA_HEIGHT, cam_config
+            )
             video_writer.append_data(frame)
         elif env.renderer == "mjviewer":
             if env.viewer is None:
                 env.initialize_renderer()
+            if cam_config is not None:
+                apply_mjviewer_camera_config(env, cam_config)
             env.viewer.update()
         else:
             env.render()
@@ -563,10 +618,12 @@ def _play_state_sequence(
     print(colored("Playback finished.", "green"))
 
 
-def _record_preview_video(env, video_path: str, camera_name: str = CAMERA_NAME_PREVIEW):
+def _record_preview_video(env, video_path: str):
+    env.reset()
+    cam_config = _compute_preview_cam_config(env)
     states = _generate_preview_states(env)
     writer = imageio.get_writer(video_path, fps=PREVIEW_FPS)
-    _play_state_sequence(env, states, video_writer=writer, camera_name=camera_name)
+    _play_state_sequence(env, states, video_writer=writer, cam_config=cam_config)
     writer.close()
     print(colored(f"Saved preview video to {video_path}", "green"))
 
@@ -620,10 +677,13 @@ def play_move_pan_live(
         _record_preview_video(env, video_path)
         return
 
+    env.reset()
+    cam_config = _compute_preview_cam_config(env)
     states = _generate_preview_states(env)
     reset_to(env, {"states": states[0]})
 
     if pygame_viewer is not None:
+        pygame_viewer.free_cam_config = cam_config
         print(colored("Opening viewer (pygame window)...", "yellow"))
         _play_state_sequence(env, states, pygame_viewer=pygame_viewer)
         print(
@@ -635,8 +695,17 @@ def play_move_pan_live(
         )
         pygame_viewer.wait_until_closed(env.sim)
         pygame_viewer.close()
+    elif onscreen_renderer == "mjviewer":
+        _play_state_sequence(env, states, cam_config=cam_config)
+        try:
+            input("Press Enter to close the viewer...")
+        except EOFError:
+            pass
+        if env.viewer is not None:
+            env.viewer.close()
+            env.viewer = None
     elif onscreen_renderer == "mujoco":
-        _play_state_sequence(env, states)
+        _play_state_sequence(env, states, cam_config=cam_config)
         try:
             input("Press Enter to close the viewer...")
         except EOFError:

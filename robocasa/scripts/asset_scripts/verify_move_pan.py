@@ -9,7 +9,15 @@ import gymnasium as gym
 import numpy as np
 import robocasa
 from robocasa.demos.demo_pan_move_sandbox import DEFAULT_PAN_MJCF, PanMoveSandboxEnv
-from robocasa.demos.move_pan_live import _generate_preview_states, _get_eef_pose, make_move_pan_env
+from robocasa.demos.move_pan_live import (
+    MAX_PAN_EEF_ATTACH_DIST,
+    _build_move_pan_timeline,
+    _compute_target_pan_pose,
+    _generate_preview_states,
+    _get_eef_pose,
+    _get_pan_pose,
+    make_move_pan_env,
+)
 from robocasa.environments import REGISTERED_KITCHEN_ENVS
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 from robocasa.utils.env_utils import create_env
@@ -83,17 +91,39 @@ def verify_preview_arm_motion(layout: int = 15, style: int = 34, seed: int = 0) 
         render_offscreen=True,
     )
     env.reset()
-    home_eef, _ = _get_eef_pose(env)
+    start_pan, start_quat = _get_pan_pose(env)
+    end_pan, end_quat = _compute_target_pan_pose(env, start_pan, start_quat)
+    home_eef, home_eef_quat, _ = _get_eef_pose(env)
+    timeline = _build_move_pan_timeline(
+        start_pan, end_pan, start_quat, end_quat, home_eef, home_eef_quat
+    )
 
     states = _generate_preview_states(env)
     assert len(states) >= 100
+    assert len(states) == len(timeline)
+
+    max_attach_dist = 0.0
+    for state, frame in zip(states, timeline):
+        if not frame.attach:
+            continue
+        reset_to(env, {"states": state})
+        eef_pos, _, _ = _get_eef_pose(env)
+        pan_pos, _ = _get_pan_pose(env)
+        max_attach_dist = max(max_attach_dist, float(np.linalg.norm(pan_pos - eef_pos)))
+
+    assert max_attach_dist < MAX_PAN_EEF_ATTACH_DIST, (
+        f"pan should follow gripper during grasp (max dist {max_attach_dist:.3f}m)"
+    )
 
     reset_to(env, {"states": states[-1]})
-    final_eef, _ = _get_eef_pose(env)
+    final_eef, _, _ = _get_eef_pose(env)
     dist = float(np.linalg.norm(final_eef - home_eef))
     assert dist > 0.05, f"expected arm motion, got {dist:.3f}m"
     env.close()
-    print(f"OK preview arm motion (eef delta {dist:.2f}m, {len(states)} frames)")
+    print(
+        f"OK preview arm motion (eef delta {dist:.2f}m, "
+        f"max grasp dist {max_attach_dist:.3f}m, {len(states)} frames)"
+    )
 
 
 def main():
