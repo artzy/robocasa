@@ -5,12 +5,16 @@ from collections import OrderedDict
 from termcolor import colored
 
 import robocasa
-from robocasa.demos.move_pan_live import play_move_pan_live
+from robocasa.demos.live_preview.home_pose import resolve_home_preset_path
+from robocasa.demos.live_preview.registry import HOME_DEMO_TASKS, LIVE_DEMO_REGISTRY, LIVE_DEMO_TASKS
+from robocasa.demos.live_preview.home_demo_playback import play_human_demo_with_home
 from robocasa.scripts.download_datasets import download_datasets
 from robocasa.scripts.dataset_scripts.playback_dataset import playback_dataset
 from robocasa.utils.dataset_registry_utils import get_ds_path
-
-LIVE_DEMO_TASKS = frozenset({"MovePan"})
+from robocasa.utils.playback_viewer import (
+    DEFAULT_VIEWER_HEIGHT,
+    DEFAULT_VIEWER_WIDTH,
+)
 
 
 def get_ds_path_any_split(task, source="human"):
@@ -117,8 +121,49 @@ if __name__ == "__main__":
     parser.add_argument(
         "--home-preset",
         type=str,
-        default="robocasa/demos/move_pan_home_presets/default_layout15_seed0.json",
-        help="MovePan: JSON home pose preset (base + EEF)",
+        default=None,
+        help="Live preview: JSON home pose preset (default: task-specific preset)",
+    )
+    parser.add_argument(
+        "--renderer",
+        type=str,
+        default=None,
+        choices=("mjviewer", "mujoco", "pygame"),
+        help="Home demo on-screen renderer (default: mjviewer for smooth GPU playback)",
+    )
+    parser.add_argument(
+        "--playback-fps",
+        type=float,
+        default=60,
+        help="Home demo playback frame rate (default: 60)",
+    )
+    parser.add_argument(
+        "--demo-stride",
+        type=int,
+        default=None,
+        help="Subsample human demo frames during home wrap (default: task registry)",
+    )
+    parser.add_argument(
+        "--viewer-width",
+        type=int,
+        default=1280,
+        help="Pygame viewer width (default: 1280)",
+    )
+    parser.add_argument(
+        "--viewer-height",
+        type=int,
+        default=720,
+        help="Pygame viewer height (default: 720)",
+    )
+    parser.add_argument(
+        "--no-dwell",
+        action="store_true",
+        help="Skip Home start/end dwell pause",
+    )
+    parser.add_argument(
+        "--rebuild-wrap",
+        action="store_true",
+        help="Ignore cached home-wrapped states and rebuild",
     )
     args = parser.parse_args()
 
@@ -140,15 +185,15 @@ if __name__ == "__main__":
             ("PrepareCoffee", "make coffee"),
             (
                 "HotDogSetup",
-                "gather ingredients for a hot dog and place them on the dining table [Navigation]",
+                "gather ingredients for a hot dog and place them on the dining table [Human demo + Home start/end]",
             ),
             (
                 "DeliverStraw",
-                "place the straw in the glass cup on the dining counter [Navigation]",
+                "deliver straw to glass cup [Human demo + Home start/end]",
             ),
             (
                 "MovePan",
-                "move coppelia pan between fixtures [Live preview, no human demo]",
+                "move coppelia pan [Live preview: Home start/end - NOT human demo]",
             ),
             (
                 "GatherTableware",
@@ -160,6 +205,7 @@ if __name__ == "__main__":
         (k, v)
         for k, v in all_tasks.items()
         if k in LIVE_DEMO_TASKS
+        or k in HOME_DEMO_TASKS
         or get_ds_path_any_split(k, source="human") is not None
     )
     if not tasks:
@@ -188,7 +234,24 @@ if __name__ == "__main__":
             video_path = False
 
         if task in LIVE_DEMO_TASKS:
-            play_move_pan_live(
+            spec = LIVE_DEMO_REGISTRY[task]
+            home_preset = resolve_home_preset_path(task, args.home_preset)
+            if home_preset is not None and not home_preset.exists():
+                print(
+                    colored(
+                        f"warning: home preset not found ({home_preset}); "
+                        "MovePan will use reset pose as Home",
+                        "yellow",
+                    )
+                )
+            print(
+                colored(
+                    f"Live preview '{task}' - Home preset: "
+                    f"{home_preset if home_preset else 'default'}",
+                    "cyan",
+                )
+            )
+            spec.play(
                 source_fixture=args.source_fixture,
                 target_fixture=args.target_fixture,
                 obj_registries=args.obj_registries,
@@ -197,7 +260,58 @@ if __name__ == "__main__":
                 video_path=video_path,
                 layout=args.layout,
                 style=args.style,
-                home_preset=args.home_preset,
+                seed=0,
+                home_preset=str(home_preset) if home_preset else None,
+            )
+            if args.task is not None:
+                break
+            print()
+            continue
+
+        if task in HOME_DEMO_TASKS:
+            home_preset = resolve_home_preset_path(task, args.home_preset)
+            if home_preset is not None and not home_preset.exists():
+                print(
+                    colored(
+                        f"warning: home preset not found ({home_preset}); "
+                        f"{task} will use reset pose as Home",
+                        "yellow",
+                    )
+                )
+            print(
+                colored(
+                    f"Home-wrapped demo '{task}' - preset: "
+                    f"{home_preset if home_preset else 'default'}",
+                    "cyan",
+                )
+            )
+            dataset = get_ds_path_any_split(task, source="human")
+            if dataset is None:
+                raise ValueError(f"No registered dataset path for task={task} source=human")
+            if not os.path.exists(dataset):
+                print(
+                    colored(
+                        "Unable to find dataset locally. Downloading...", color="yellow"
+                    )
+                )
+                download_datasets(
+                    tasks=[task], split=["pretrain", "target"], source=["human"]
+                )
+            play_human_demo_with_home(
+                task,
+                dataset=dataset,
+                render_offscreen=args.render_offscreen,
+                video_path=video_path,
+                home_preset=str(home_preset) if home_preset else None,
+                layout=args.layout,
+                style=args.style,
+                demo_stride=args.demo_stride,
+                playback_fps=args.playback_fps,
+                renderer=args.renderer,
+                viewer_width=args.viewer_width,
+                viewer_height=args.viewer_height,
+                no_dwell=args.no_dwell,
+                rebuild_wrap=args.rebuild_wrap,
             )
             if args.task is not None:
                 break
@@ -230,8 +344,8 @@ if __name__ == "__main__":
         first = False
         verbose = True
         extend_states = True
-        camera_height = 512
-        camera_width = 768
+        camera_height = DEFAULT_VIEWER_HEIGHT
+        camera_width = DEFAULT_VIEWER_WIDTH
 
         playback_dataset(
             dataset=dataset,

@@ -12,7 +12,6 @@ import numpy as np
 import robosuite
 import robosuite.utils.transform_utils as T
 from robosuite.controllers import load_composite_controller_config
-from robosuite.controllers.parts.arm.ik import InverseKinematicsController
 from robosuite.wrappers import VisualizationWrapper
 from termcolor import colored
 
@@ -22,7 +21,6 @@ from robocasa.models.fixtures.fixture import FixtureType
 from robocasa.models.fixtures.fixture_utils import fixture_is_type
 from robocasa.scripts.collect_demos import collect_human_trajectory
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
-from robocasa.utils import env_utils as EnvUtils
 from robocasa.utils.playback_viewer import (
     PygamePlaybackViewer,
     apply_mjviewer_camera_config,
@@ -30,6 +28,40 @@ from robocasa.utils.playback_viewer import (
     onscreen_renderer_name,
     render_free_camera,
     robosuite_viewer_kwargs,
+    DEFAULT_VIEWER_HEIGHT,
+    DEFAULT_VIEWER_WIDTH,
+)
+from robocasa.demos.live_preview.home_pose import (
+    HOME_BASE_TOLERANCE,
+    HOME_EEF_TOLERANCE,
+    RobotHomePose,
+    load_home_preset,
+    resolve_home_preset_path,
+    save_home_preset,
+)
+from robocasa.demos.live_preview.base_path_planning import (
+    plan_base_waypoints,
+    sample_base_poses_along_waypoints,
+)
+from robocasa.demos.live_preview.robot_bridge import RobotSnapshot
+from robocasa.demos.live_preview.return_home import append_return_home_frames
+from robocasa.demos.live_preview.robot_session import (
+    apply_home_pose as _apply_home_pose,
+    capture_home_from_env,
+    compute_robot_base_near_fixture as _compute_robot_base_near_fixture,
+    get_eef_pose as _get_eef_pose,
+    get_robot_base_pose as _get_robot_base_pose,
+    resolve_base_env as _resolve_base_env,
+    resolve_home_pose as _resolve_home_pose,
+    resolve_robot as _resolve_robot,
+    set_gripper as _set_gripper,
+    set_robot_base_pose as _set_robot_base_pose,
+    solve_eef_pose as _solve_eef_pose,
+)
+from robocasa.demos.live_preview.timeline_utils import (
+    lerp_scalar as _lerp_scalar,
+    lerp_vec as _lerp_vec,
+    lerp_yaw as _lerp_yaw,
 )
 from robocasa.wrappers.enclosing_wall_render_wrapper import (
     EnclosingWallRenderWrapper,
@@ -37,8 +69,8 @@ from robocasa.wrappers.enclosing_wall_render_wrapper import (
 )
 
 CAMERA_NAME_TELEOP = "robot0_frontview"
-CAMERA_WIDTH = 1536
-CAMERA_HEIGHT = 1024
+CAMERA_WIDTH = DEFAULT_VIEWER_WIDTH
+CAMERA_HEIGHT = DEFAULT_VIEWER_HEIGHT
 PREVIEW_FPS = 20
 
 PREVIEW_DEFAULT_LAYOUT = 15
@@ -58,7 +90,9 @@ MAX_PAN_EEF_ATTACH_DIST = 0.12
 MAX_GRASP_SITE_ATTACH_DIST = 0.10
 PAN_GRASP_SITE = "pan_grasp_site"
 
-PHASE_HOLD_START = 10
+PREVIEW_HOME_DWELL_SEC = 1.5
+
+PHASE_HOLD_START = 30
 PHASE_MOVE_TO_PICK = 25
 PHASE_APPROACH = 20
 PHASE_DESCEND = 15
@@ -66,17 +100,9 @@ PHASE_LIFT = 15
 PHASE_MOVE_TO_PLACE = 40
 PHASE_PLACE = 15
 PHASE_RETREAT = 10
-PHASE_RETURN_BASE = 30
-PHASE_RETURN_ARM = 20
-PHASE_HOLD_END = 30
 
-HOME_BASE_TOLERANCE = 0.02
-HOME_EEF_TOLERANCE = 0.05
-
-_DEMO_DIR = Path(__file__).resolve().parent
-DEFAULT_HOME_PRESET = (
-    _DEMO_DIR / "move_pan_home_presets" / "default_layout15_seed0.json"
-)
+MovePanHomePose = RobotHomePose
+DEFAULT_HOME_PRESET = resolve_home_preset_path("MovePan", None)
 
 IK_POS_TOL = 0.015
 IK_MAX_ITERS = 40
@@ -228,19 +254,6 @@ def make_input_device(env, device: str = "keyboard"):
     )
 
 
-def _resolve_base_env(env):
-    cur = env
-    while cur is not None:
-        if hasattr(cur, "robots") and hasattr(cur, "sim"):
-            return cur
-        cur = getattr(cur, "env", None)
-    return env
-
-
-def _resolve_robot(env):
-    return _resolve_base_env(env).robots[0]
-
-
 def _print_instruction(env):
     ep_meta = env.get_ep_meta()
     if isinstance(ep_meta, str):
@@ -249,19 +262,6 @@ def _print_instruction(env):
     if lang:
         print(colored(f"Instruction: {lang}", "green"))
     print(colored("Spawning environment...", "yellow"))
-
-
-def _smoothstep(alpha: float) -> float:
-    alpha = float(np.clip(alpha, 0.0, 1.0))
-    return alpha * alpha * (3.0 - 2.0 * alpha)
-
-
-def _lerp_vec(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
-    return a + _smoothstep(alpha) * (b - a)
-
-
-def _lerp_scalar(a: float, b: float, alpha: float) -> float:
-    return float(a + _smoothstep(alpha) * (b - a))
 
 
 def _get_pan_pose(env):
@@ -338,16 +338,6 @@ def _set_pan_pose(env, pos, quat):
         env.update_state()
 
 
-def _get_eef_pose(env):
-    robot = _resolve_robot(env)
-    site_id = robot.eef_site_id["right"]
-    pos = np.array(env.sim.data.site_xpos[site_id], dtype=float)
-    mat = env.sim.data.site_xmat[site_id].reshape(3, 3)
-    quat_xyzw = T.mat2quat(mat)
-    quat = T.convert_quat(quat_xyzw, to="wxyz")
-    return pos, quat, mat
-
-
 def _eef_local_to_world(eef_pos: np.ndarray, eef_mat: np.ndarray, local_offset: np.ndarray):
     return eef_pos + eef_mat @ local_offset
 
@@ -366,280 +356,6 @@ def _snap_pan_to_gripper(
     pan_pos = _body_pos_from_grasp_world(grasp_world, pan_quat, grasp_local)
     _set_pan_pose(env, pan_pos, pan_quat)
     return local_offset.copy()
-
-
-def _arm_qpos_indices(env):
-    robot = _resolve_robot(env)
-    split = robot._joint_split_idx
-    return np.array(robot._ref_arm_joint_pos_indexes[:split], dtype=int)
-
-
-def _eef_site_name(env) -> str:
-    robot = _resolve_robot(env)
-    site_id = robot.eef_site_id["right"]
-    return env.sim.model.site(site_id).name
-
-
-def _set_gripper(env, closed: float, open_qpos: np.ndarray):
-    robot = _resolve_robot(env)
-    idx = robot._ref_gripper_joint_pos_indexes["right"]
-    closed = float(np.clip(closed, 0.0, 1.0))
-    env.sim.data.qpos[idx] = open_qpos * (1.0 - closed)
-
-
-def _solve_eef_pose(
-    env,
-    target_pos: np.ndarray,
-    target_quat: np.ndarray,
-    *,
-    iters: int = IK_MAX_ITERS,
-    pos_tol: float = IK_POS_TOL,
-) -> bool:
-    sim = env.sim
-    arm_qpos_idx = _arm_qpos_indices(env)
-    ref_name = _eef_site_name(env)
-    site_id = _resolve_robot(env).eef_site_id["right"]
-
-    tgt_mat = T.quat2mat(T.convert_quat(target_quat, to="xyzw"))
-
-    for _ in range(iters):
-        cur_pos = np.array(sim.data.site_xpos[site_id], dtype=float)
-        dpos = target_pos - cur_pos
-        if np.linalg.norm(dpos) < pos_tol:
-            return True
-
-        cur_quat_xyzw = T.mat2quat(
-            sim.data.site_xmat[site_id].reshape(3, 3)
-        )
-        cur_mat = T.quat2mat(cur_quat_xyzw)
-        drot = tgt_mat @ cur_mat.T
-
-        q0 = sim.data.qpos[arm_qpos_idx].copy()
-        q_des = InverseKinematicsController.compute_joint_positions(
-            sim=sim,
-            initial_joint=q0,
-            joint_indices=arm_qpos_idx,
-            ref_name=ref_name,
-            control_freq=20.0,
-            use_delta=True,
-            dpos=dpos * 0.35,
-            drot=drot.reshape(-1),
-            integration_dt=0.05,
-            Kpos=0.95,
-            Kori=0.95,
-        )
-        sim.data.qpos[arm_qpos_idx] = q_des
-        sim.forward()
-
-    return np.linalg.norm(target_pos - sim.data.site_xpos[site_id]) < pos_tol * 3.0
-
-
-def _lerp_yaw(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
-    az = float(a[2])
-    bz = float(b[2])
-    diff = (bz - az + np.pi) % (2.0 * np.pi) - np.pi
-    out = np.array(a, dtype=float).copy()
-    out[2] = az + _smoothstep(alpha) * diff
-    return out
-
-
-@dataclass
-class MovePanHomePose:
-    base_pos: np.ndarray
-    base_ori: np.ndarray
-    eef_pos: np.ndarray
-    eef_quat: np.ndarray
-    gripper: float = 0.0
-    name: str = ""
-    layout: int | None = None
-    style: int | None = None
-    seed: int | None = None
-    source_fixture: str | None = None
-    target_fixture: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "layout": self.layout,
-            "style": self.style,
-            "seed": self.seed,
-            "source_fixture": self.source_fixture,
-            "target_fixture": self.target_fixture,
-            "base_pos": self.base_pos.tolist(),
-            "base_yaw": float(self.base_ori[2]),
-            "eef_pos": self.eef_pos.tolist(),
-            "eef_quat_wxyz": self.eef_quat.tolist(),
-            "gripper": float(self.gripper),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> MovePanHomePose:
-        base_yaw = float(data.get("base_yaw", 0.0))
-        return cls(
-            name=str(data.get("name", "")),
-            layout=data.get("layout"),
-            style=data.get("style"),
-            seed=data.get("seed"),
-            source_fixture=data.get("source_fixture"),
-            target_fixture=data.get("target_fixture"),
-            base_pos=np.asarray(data["base_pos"], dtype=float),
-            base_ori=np.array([0.0, 0.0, base_yaw], dtype=float),
-            eef_pos=np.asarray(data["eef_pos"], dtype=float),
-            eef_quat=np.asarray(data["eef_quat_wxyz"], dtype=float),
-            gripper=float(data.get("gripper", 0.0)),
-        )
-
-
-def load_home_preset(path: Path | str) -> MovePanHomePose:
-    preset_path = Path(path)
-    with preset_path.open(encoding="utf-8") as f:
-        return MovePanHomePose.from_dict(json.load(f))
-
-
-def save_home_preset(home: MovePanHomePose, path: Path | str) -> Path:
-    preset_path = Path(path)
-    preset_path.parent.mkdir(parents=True, exist_ok=True)
-    with preset_path.open("w", encoding="utf-8") as f:
-        json.dump(home.to_dict(), f, indent=2)
-        f.write("\n")
-    return preset_path
-
-
-def capture_home_from_env(
-    env,
-    *,
-    name: str = "",
-    layout: int | None = None,
-    style: int | None = None,
-    seed: int | None = None,
-    source_fixture: str | None = None,
-    target_fixture: str | None = None,
-) -> MovePanHomePose:
-    base_pos, base_ori = _get_robot_base_pose(env)
-    eef_pos, eef_quat, _ = _get_eef_pose(env)
-    return MovePanHomePose(
-        name=name,
-        layout=layout,
-        style=style,
-        seed=seed,
-        source_fixture=source_fixture,
-        target_fixture=target_fixture,
-        base_pos=base_pos.copy(),
-        base_ori=base_ori.copy(),
-        eef_pos=eef_pos.copy(),
-        eef_quat=eef_quat.copy(),
-        gripper=0.0,
-    )
-
-
-def _warn_home_mismatch(
-    home: MovePanHomePose,
-    *,
-    layout: int | None,
-    style: int | None,
-    seed: int | None,
-    source_fixture: str,
-    target_fixture: str,
-) -> None:
-    checks = (
-        ("layout", home.layout, layout),
-        ("style", home.style, style),
-        ("seed", home.seed, seed),
-        ("source_fixture", home.source_fixture, source_fixture),
-        ("target_fixture", home.target_fixture, target_fixture),
-    )
-    mismatches = [
-        f"{name}: preset={preset!r} runtime={runtime!r}"
-        for name, preset, runtime in checks
-        if preset is not None and runtime is not None and preset != runtime
-    ]
-    if mismatches:
-        print(
-            colored(
-                "warning: home preset metadata mismatch — "
-                + "; ".join(mismatches),
-                "yellow",
-            )
-        )
-
-
-def _resolve_home_pose(
-    env,
-    preset_path: Path | str | None,
-    *,
-    layout: int | None,
-    style: int | None,
-    seed: int | None,
-    source_fixture: str,
-    target_fixture: str,
-) -> MovePanHomePose:
-    path = Path(preset_path) if preset_path is not None else DEFAULT_HOME_PRESET
-    if path.exists():
-        home = load_home_preset(path)
-        _warn_home_mismatch(
-            home,
-            layout=layout,
-            style=style,
-            seed=seed,
-            source_fixture=source_fixture,
-            target_fixture=target_fixture,
-        )
-        return home
-
-    print(
-        colored(
-            f"warning: home preset not found ({path}); using reset pose snapshot",
-            "yellow",
-        )
-    )
-    return capture_home_from_env(
-        env,
-        name="reset_snapshot",
-        layout=layout,
-        style=style,
-        seed=seed,
-        source_fixture=source_fixture,
-        target_fixture=target_fixture,
-    )
-
-
-def _apply_home_pose(
-    env,
-    home: MovePanHomePose,
-    open_gripper_qpos: np.ndarray,
-) -> bool:
-    _set_robot_base_pose(env, home.base_pos, home.base_ori)
-    ik_ok = _solve_eef_pose(env, home.eef_pos, home.eef_quat)
-    _set_gripper(env, home.gripper, open_gripper_qpos)
-    env.sim.forward()
-    if hasattr(env, "update_state"):
-        env.update_state()
-    return ik_ok
-
-
-def _get_robot_base_pose(env):
-    base_env = _resolve_base_env(env)
-    body_id = base_env.sim.model.body_name2id("mobilebase0_base")
-    pos = np.array(base_env.sim.data.body_xpos[body_id], dtype=float)
-    ori = T.mat2euler(base_env.sim.data.body_xmat[body_id].reshape(3, 3))
-    return pos, ori
-
-
-def _compute_robot_base_near_fixture(env, fixture):
-    base_env = _resolve_base_env(env)
-    return EnvUtils.compute_robot_base_placement_pose(
-        base_env, fixture, ref_object="pan"
-    )
-
-
-def _set_robot_base_pose(env, global_pos: np.ndarray, global_ori: np.ndarray):
-    base_env = _resolve_base_env(env)
-    EnvUtils.set_robot_to_position(base_env, global_pos)
-    yaw_addr = base_env.sim.model.get_joint_qpos_addr("mobilebase0_joint_mobile_yaw")
-    base_env.sim.data.qpos[yaw_addr] = (
-        float(global_ori[2]) - float(base_env.init_robot_base_ori_anchor[2])
-    )
-    base_env.sim.forward()
 
 
 def _compute_target_pan_pose(env, start_pos, start_quat):
@@ -729,6 +445,9 @@ def _build_move_pan_timeline(
     start_grasp: np.ndarray | None = None,
     grasp_local: np.ndarray | None = None,
     pick_grasp_quat: np.ndarray | None = None,
+    include_return_home: bool = True,
+    leave_base_waypoints: list | None = None,
+    return_base_waypoints: list | None = None,
 ) -> list[_PreviewFrame]:
     frames: list[_PreviewFrame] = []
 
@@ -768,18 +487,36 @@ def _build_move_pan_timeline(
             base_ori=home_base_ori.copy(),
         )
 
-    for i in range(PHASE_MOVE_TO_PICK):
-        t = (i + 1) / PHASE_MOVE_TO_PICK
-        add_frame(
-            eef_pos=home_eef_pos.copy(),
-            eef_quat=home_eef_quat.copy(),
-            gripper=0.0,
-            pan_pos=start_pan.copy(),
-            pan_quat=start_quat.copy(),
-            attach=False,
-            base_pos=_lerp_vec(home_base_pos, pick_base_pos, t),
-            base_ori=_lerp_yaw(home_base_ori, pick_base_ori, t),
-        )
+    if leave_base_waypoints is not None:
+        for base_pos, base_ori in sample_base_poses_along_waypoints(
+            leave_base_waypoints,
+            home_base_ori,
+            pick_base_ori,
+            PHASE_MOVE_TO_PICK,
+        ):
+            add_frame(
+                eef_pos=home_eef_pos.copy(),
+                eef_quat=home_eef_quat.copy(),
+                gripper=0.0,
+                pan_pos=start_pan.copy(),
+                pan_quat=start_quat.copy(),
+                attach=False,
+                base_pos=base_pos,
+                base_ori=base_ori,
+            )
+    else:
+        for i in range(PHASE_MOVE_TO_PICK):
+            t = (i + 1) / PHASE_MOVE_TO_PICK
+            add_frame(
+                eef_pos=home_eef_pos.copy(),
+                eef_quat=home_eef_quat.copy(),
+                gripper=0.0,
+                pan_pos=start_pan.copy(),
+                pan_quat=start_quat.copy(),
+                attach=False,
+                base_pos=_lerp_vec(home_base_pos, pick_base_pos, t),
+                base_ori=_lerp_yaw(home_base_ori, pick_base_ori, t),
+            )
 
     for i in range(PHASE_APPROACH):
         t = (i + 1) / PHASE_APPROACH
@@ -860,42 +597,19 @@ def _build_move_pan_timeline(
             base_ori=place_base_ori.copy(),
         )
 
-    for i in range(PHASE_RETURN_BASE):
-        t = (i + 1) / PHASE_RETURN_BASE
-        add_frame(
-            eef_pos=retreat_target.copy(),
-            eef_quat=home_eef_quat.copy(),
-            gripper=0.0,
-            pan_pos=end_pan.copy(),
-            pan_quat=end_quat.copy(),
-            attach=False,
-            base_pos=_lerp_vec(place_base_pos, home_base_pos, t),
-            base_ori=_lerp_yaw(place_base_ori, home_base_ori, t),
-        )
-
-    for i in range(PHASE_RETURN_ARM):
-        t = (i + 1) / PHASE_RETURN_ARM
-        add_frame(
-            eef_pos=_lerp_vec(retreat_target, home_eef_pos, t),
-            eef_quat=home_eef_quat.copy(),
-            gripper=0.0,
-            pan_pos=end_pan.copy(),
-            pan_quat=end_quat.copy(),
-            attach=False,
-            base_pos=home_base_pos.copy(),
-            base_ori=home_base_ori.copy(),
-        )
-
-    for _ in range(PHASE_HOLD_END):
-        add_frame(
-            eef_pos=home_eef_pos.copy(),
-            eef_quat=home_eef_quat.copy(),
-            gripper=0.0,
-            pan_pos=end_pan.copy(),
-            pan_quat=end_quat.copy(),
-            attach=False,
-            base_pos=home_base_pos.copy(),
-            base_ori=home_base_ori.copy(),
+    if include_return_home:
+        append_return_home_frames(
+            add_frame,
+            retreat_target=retreat_target,
+            home_eef_pos=home_eef_pos,
+            home_eef_quat=home_eef_quat,
+            home_base_pos=home_base_pos,
+            home_base_ori=home_base_ori,
+            place_base_pos=place_base_pos,
+            place_base_ori=place_base_ori,
+            end_pan=end_pan,
+            end_quat=end_quat,
+            base_waypoints=return_base_waypoints,
         )
 
     return frames
@@ -961,6 +675,7 @@ def _generate_preview_states(
     open_gripper_qpos = _resolve_robot(env).get_gripper_joint_positions("right").copy()
     home = _resolve_home_pose(
         env,
+        "MovePan",
         home_preset,
         layout=layout,
         style=style,
@@ -977,14 +692,38 @@ def _generate_preview_states(
         )
 
     timeline_inputs = _collect_preview_timeline_inputs(env, home)
-    timeline = _build_move_pan_timeline(**timeline_inputs)
+    start_anchor = np.array(env.sim.get_state().flatten())
+    home_arm = RobotSnapshot(
+        base_pos=timeline_inputs["home_base_pos"],
+        base_ori=timeline_inputs["home_base_ori"],
+        eef_pos=timeline_inputs["home_eef_pos"],
+        eef_quat=timeline_inputs["home_eef_quat"],
+        gripper=0.0,
+    )
+    leave_wps = plan_base_waypoints(
+        env,
+        start_anchor,
+        timeline_inputs["home_base_pos"],
+        timeline_inputs["pick_base_pos"],
+        timeline_inputs["home_base_ori"],
+        timeline_inputs["pick_base_ori"],
+        home_arm,
+        open_gripper_qpos,
+    )
 
+    partial_timeline = _build_move_pan_timeline(
+        **timeline_inputs,
+        include_return_home=False,
+        leave_base_waypoints=leave_wps,
+    )
+
+    reset_to(env, {"states": start_anchor})
     states = []
     ik_warned = [False]
     degraded = [False]
     grasp_local = timeline_inputs.get("grasp_local")
 
-    for frame in timeline:
+    for frame in partial_timeline:
         _apply_preview_frame(
             env,
             frame,
@@ -994,6 +733,68 @@ def _generate_preview_states(
             degraded=degraded,
         )
         states.append(np.array(env.sim.get_state().flatten()))
+
+    end_anchor = np.array(env.sim.get_state().flatten())
+    start_grasp = timeline_inputs.get("start_grasp")
+    if start_grasp is None:
+        start_grasp = timeline_inputs["start_pan"]
+    grasp_local = timeline_inputs.get("grasp_local")
+    end_pan = timeline_inputs["end_pan"]
+    end_quat = timeline_inputs["end_quat"]
+    if grasp_local is not None:
+        end_grasp = _grasp_world_from_body(end_pan, end_quat, grasp_local)
+    else:
+        end_grasp = end_pan.copy()
+    retreat_target = end_grasp + np.array([0.0, 0.0, RETREAT_Z])
+    retreat_arm = RobotSnapshot(
+        base_pos=timeline_inputs["place_base_pos"],
+        base_ori=timeline_inputs["place_base_ori"],
+        eef_pos=retreat_target,
+        eef_quat=timeline_inputs["home_eef_quat"],
+        gripper=0.0,
+    )
+    return_wps = plan_base_waypoints(
+        env,
+        end_anchor,
+        timeline_inputs["place_base_pos"],
+        timeline_inputs["home_base_pos"],
+        timeline_inputs["place_base_ori"],
+        timeline_inputs["home_base_ori"],
+        retreat_arm,
+        open_gripper_qpos,
+    )
+
+    return_frames: list[_PreviewFrame] = []
+
+    def _add_return_frame(**kwargs):
+        return_frames.append(_PreviewFrame(**kwargs))
+
+    append_return_home_frames(
+        _add_return_frame,
+        retreat_target=retreat_target,
+        home_eef_pos=timeline_inputs["home_eef_pos"],
+        home_eef_quat=timeline_inputs["home_eef_quat"],
+        home_base_pos=timeline_inputs["home_base_pos"],
+        home_base_ori=timeline_inputs["home_base_ori"],
+        place_base_pos=timeline_inputs["place_base_pos"],
+        place_base_ori=timeline_inputs["place_base_ori"],
+        end_pan=end_pan,
+        end_quat=end_quat,
+        base_waypoints=return_wps,
+    )
+
+    for frame in return_frames:
+        _apply_preview_frame(
+            env,
+            frame,
+            open_gripper_qpos=open_gripper_qpos,
+            grasp_local=grasp_local,
+            ik_warned=ik_warned,
+            degraded=degraded,
+        )
+        states.append(np.array(env.sim.get_state().flatten()))
+
+    timeline = partial_timeline + return_frames
 
     if degraded[0]:
         print(
@@ -1006,6 +807,32 @@ def _generate_preview_states(
     return np.array(states), home, timeline
 
 
+def _hold_at_state(
+    env,
+    state,
+    *,
+    pygame_viewer=None,
+    cam_config=None,
+    dwell_sec: float = PREVIEW_HOME_DWELL_SEC,
+) -> None:
+    """Show a single simulator state for a short dwell (Home pause)."""
+    reset_to(env, {"states": state})
+    if pygame_viewer is not None:
+        if cam_config is not None:
+            pygame_viewer.free_cam_config = cam_config
+        pygame_viewer.update(env.sim)
+    elif env.renderer == "mjviewer":
+        if env.viewer is None:
+            env.initialize_renderer()
+        if cam_config is not None:
+            apply_mjviewer_camera_config(env, cam_config)
+        env.viewer.update()
+    elif env.renderer != "offscreen":
+        env.render()
+    if dwell_sec > 0:
+        time.sleep(dwell_sec)
+
+
 def _play_state_sequence(
     env,
     states,
@@ -1013,9 +840,23 @@ def _play_state_sequence(
     pygame_viewer=None,
     video_writer=None,
     cam_config=None,
+    dwell_home_start: bool = False,
+    dwell_home_end: bool = False,
 ):
     print(colored("Playing back episode: MovePan scripted demo", "yellow"))
-    for state in states:
+    if len(states) == 0:
+        return
+
+    if dwell_home_start:
+        print(colored("Home - starting position", "green"))
+        _hold_at_state(
+            env,
+            states[0],
+            pygame_viewer=pygame_viewer,
+            cam_config=cam_config,
+        )
+
+    for idx, state in enumerate(states):
         start = time.time()
         if pygame_viewer is not None and not pygame_viewer.pump_events():
             break
@@ -1043,6 +884,15 @@ def _play_state_sequence(
         diff = 1.0 / PREVIEW_FPS - elapsed
         if diff > 0:
             time.sleep(diff)
+
+    if dwell_home_end:
+        print(colored("Home - task complete", "green"))
+        _hold_at_state(
+            env,
+            states[-1],
+            pygame_viewer=pygame_viewer,
+            cam_config=cam_config,
+        )
 
     print(colored("Playback finished.", "green"))
 
@@ -1134,9 +984,10 @@ def play_move_pan_live(
         )
         return
 
+    print(colored("Building MovePan preview (Home start -> task -> Home return)...", "yellow"))
     env.reset()
     cam_config = _compute_preview_cam_config(env)
-    states, _, _ = _generate_preview_states(
+    states, home, _ = _generate_preview_states(
         env,
         home_preset=home_preset,
         layout=layout,
@@ -1145,12 +996,24 @@ def play_move_pan_live(
         source_fixture=source_fixture,
         target_fixture=target_fixture,
     )
-    reset_to(env, {"states": states[0]})
+    print(
+        colored(
+            f"Preview ready: {len(states)} frames, home='{home.name or 'preset'}'",
+            "cyan",
+        )
+    )
 
     if pygame_viewer is not None:
         pygame_viewer.free_cam_config = cam_config
         print(colored("Opening viewer (pygame window)...", "yellow"))
-        _play_state_sequence(env, states, pygame_viewer=pygame_viewer)
+        _play_state_sequence(
+            env,
+            states,
+            pygame_viewer=pygame_viewer,
+            cam_config=cam_config,
+            dwell_home_start=True,
+            dwell_home_end=True,
+        )
         print(
             colored(
                 "Close the window, press Esc/Enter/q in the viewer, "
@@ -1161,7 +1024,13 @@ def play_move_pan_live(
         pygame_viewer.wait_until_closed(env.sim)
         pygame_viewer.close()
     elif onscreen_renderer == "mjviewer":
-        _play_state_sequence(env, states, cam_config=cam_config)
+        _play_state_sequence(
+            env,
+            states,
+            cam_config=cam_config,
+            dwell_home_start=True,
+            dwell_home_end=True,
+        )
         try:
             input("Press Enter to close the viewer...")
         except EOFError:
@@ -1170,7 +1039,13 @@ def play_move_pan_live(
             env.viewer.close()
             env.viewer = None
     elif onscreen_renderer == "mujoco":
-        _play_state_sequence(env, states, cam_config=cam_config)
+        _play_state_sequence(
+            env,
+            states,
+            cam_config=cam_config,
+            dwell_home_start=True,
+            dwell_home_end=True,
+        )
         try:
             input("Press Enter to close the viewer...")
         except EOFError:

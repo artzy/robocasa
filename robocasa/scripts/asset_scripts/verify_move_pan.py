@@ -9,10 +9,13 @@ import gymnasium as gym
 import numpy as np
 import robocasa
 from robocasa.demos.demo_pan_move_sandbox import DEFAULT_PAN_MJCF, PanMoveSandboxEnv
-from robocasa.demos.move_pan_live import (
-    DEFAULT_HOME_PRESET,
+from robocasa.demos.live_preview.home_pose import (
     HOME_BASE_TOLERANCE,
     HOME_EEF_TOLERANCE,
+    load_home_preset,
+    resolve_home_preset_path,
+)
+from robocasa.demos.move_pan_live import (
     MAX_GRASP_SITE_ATTACH_DIST,
     PAN_GRASP_SITE,
     _generate_preview_states,
@@ -20,13 +23,14 @@ from robocasa.demos.move_pan_live import (
     _get_pan_grasp_pose,
     _get_pan_pose,
     _get_robot_base_pose,
-    load_home_preset,
     make_move_pan_env,
 )
 from robocasa.environments import REGISTERED_KITCHEN_ENVS
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 from robocasa.utils.env_utils import create_env
 from robosuite.controllers import load_composite_controller_config
+
+DEFAULT_HOME_PRESET = resolve_home_preset_path("MovePan", None)
 
 
 def verify_kitchen_move_pan(layout: int = 15, style: int = 34, seed: int = 0) -> None:

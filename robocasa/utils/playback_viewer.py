@@ -7,6 +7,10 @@ import sys
 import numpy as np
 
 
+DEFAULT_VIEWER_WIDTH = 1536
+DEFAULT_VIEWER_HEIGHT = 1024
+
+
 def _stdin_ready():
     """Return True when Enter or q was pressed in the terminal (non-blocking)."""
     if sys.platform == "win32":
@@ -91,8 +95,8 @@ class PygamePlaybackViewer:
     def __init__(
         self,
         camera_name="robot0_agentview_center",
-        width=768,
-        height=512,
+        width=DEFAULT_VIEWER_WIDTH,
+        height=DEFAULT_VIEWER_HEIGHT,
         title="RoboCasa",
         free_cam_config=None,
     ):
@@ -129,7 +133,7 @@ class PygamePlaybackViewer:
         self._handle_events()
         return not self._should_close
 
-    def update(self, sim):
+    def update(self, sim, *, pace: bool = False):
         self._handle_events()
         if self._should_close:
             return False
@@ -151,7 +155,8 @@ class PygamePlaybackViewer:
         self._last_surface = surf
         self.screen.blit(surf, (0, 0))
         self._pygame.display.flip()
-        self.clock.tick(60)
+        if pace:
+            self.clock.tick(60)
         return True
 
     def wait_until_closed(self, sim=None):
@@ -198,7 +203,9 @@ def opencv_gui_available():
         return False
 
 
-def onscreen_renderer_name():
+def onscreen_renderer_name(prefer: str | None = None):
+    if prefer is not None:
+        return prefer
     if sys.platform == "win32":
         return "mujoco" if opencv_gui_available() else "pygame"
     return "mjviewer"
