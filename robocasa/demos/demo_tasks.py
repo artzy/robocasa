@@ -1,16 +1,16 @@
 import argparse
-import json
 import os
-import time
 from collections import OrderedDict
 
-import robosuite
 from termcolor import colored
 
 import robocasa
+from robocasa.demos.move_pan_live import play_move_pan_live
 from robocasa.scripts.download_datasets import download_datasets
 from robocasa.scripts.dataset_scripts.playback_dataset import playback_dataset
 from robocasa.utils.dataset_registry_utils import get_ds_path
+
+LIVE_DEMO_TASKS = frozenset({"MovePan"})
 
 
 def get_ds_path_any_split(task, source="human"):
@@ -89,6 +89,31 @@ if __name__ == "__main__":
         default="/tmp/robocasa_demo_tasks",
         help="path to video folder for offscreen rendering.",
     )
+    parser.add_argument(
+        "--source-fixture",
+        type=str,
+        default="counter",
+        help="MovePan source fixture (counter, sink, stove, etc.)",
+    )
+    parser.add_argument(
+        "--target-fixture",
+        type=str,
+        default="sink",
+        help="MovePan target fixture",
+    )
+    parser.add_argument(
+        "--obj-registries",
+        type=str,
+        default="coppelia_edu",
+        help="MovePan object registries (comma-separated)",
+    )
+    parser.add_argument(
+        "--teleop",
+        action="store_true",
+        help="MovePan: use keyboard teleop instead of live preview",
+    )
+    parser.add_argument("--layout", type=int, default=None, help="MovePan kitchen layout id")
+    parser.add_argument("--style", type=int, default=None, help="MovePan kitchen style id")
     args = parser.parse_args()
 
     all_tasks = OrderedDict(
@@ -116,6 +141,10 @@ if __name__ == "__main__":
                 "place the straw in the glass cup on the dining counter [Navigation]",
             ),
             (
+                "MovePan",
+                "move coppelia pan between fixtures [Live preview, no human demo]",
+            ),
+            (
                 "GatherTableware",
                 "gather tableware from around the kitchen [Navigation]",
             ),
@@ -124,11 +153,13 @@ if __name__ == "__main__":
     tasks = OrderedDict(
         (k, v)
         for k, v in all_tasks.items()
-        if get_ds_path_any_split(k, source="human") is not None
+        if k in LIVE_DEMO_TASKS
+        or get_ds_path_any_split(k, source="human") is not None
     )
     if not tasks:
         raise RuntimeError(
-            "No tasks with registered human demo paths. Check dataset registry and DATASET_BASE_PATH."
+            "No tasks with registered human demo paths or live demo tasks. "
+            "Check dataset registry and DATASET_BASE_PATH."
         )
 
     video_num = -1
@@ -142,6 +173,29 @@ if __name__ == "__main__":
         else:
             task = args.task
         video_num += 1
+
+        if args.render_offscreen:
+            if not os.path.exists(args.video_path):
+                os.makedirs(args.video_path)
+            video_path = os.path.join(args.video_path, f"video_{video_num}.mp4")
+        else:
+            video_path = False
+
+        if task in LIVE_DEMO_TASKS:
+            play_move_pan_live(
+                source_fixture=args.source_fixture,
+                target_fixture=args.target_fixture,
+                obj_registries=args.obj_registries,
+                teleop=args.teleop,
+                render_offscreen=args.render_offscreen,
+                video_path=video_path,
+                layout=args.layout,
+                style=args.style,
+            )
+            if args.task is not None:
+                break
+            print()
+            continue
 
         dataset = get_ds_path_any_split(task, source="human")
         if dataset is None:
@@ -157,17 +211,6 @@ if __name__ == "__main__":
             download_datasets(
                 tasks=[task], split=["pretrain", "target"], source=["human"]
             )
-
-        dataset = dataset
-
-        if args.render_offscreen:
-            render = True
-            if not os.path.exists(args.video_path):
-                os.makedirs(args.video_path)
-            video_path = os.path.join(args.video_path, f"video_{video_num}.mp4")
-        else:
-            render = False
-            video_path = False
 
         render = not args.render_offscreen
         use_actions = False

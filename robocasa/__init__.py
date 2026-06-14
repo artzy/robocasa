@@ -958,6 +958,7 @@ from robocasa.environments.kitchen.atomic.kitchen_pick_place import (
     PickPlaceCounterToDrawer,
     PickPlaceDrawerToCounter,
 )
+from robocasa.environments.kitchen.atomic.kitchen_move_pan import MovePan
 from robocasa.environments.kitchen.atomic.kitchen_sink import (
     TurnOnSinkFaucet,
     TurnOffSinkFaucet,
