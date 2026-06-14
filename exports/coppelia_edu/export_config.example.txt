@@ -1,0 +1,17 @@
+# CoppeliaSim batch export config for RoboCasa
+# Copy to export_config.txt and adjust paths if needed.
+
+models_root=C:\Program Files\CoppeliaRobotics\CoppeliaSimEdu\models
+output_root=D:\Github\artzy_github\Robot_Simulation\robocasa\exports\coppelia_edu
+
+# Phase 1 — Kitchen objects (mesh/OBJ)
+household/cup.ttm
+household/bowl.ttm
+household/largeBasket.ttm
+kitchenware/frying_pan_01.ttm
+
+# Phase 3 — Furniture fixture pilot (mesh/OBJ)
+furniture/tables/diningTable.ttm
+
+# Phase 3 — Robot URDF (robosuite 미지원 모델 선별; base shape 필요)
+urdf:robots/non-mobile/Dobot Magician.ttm

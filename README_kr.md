@@ -100,6 +100,116 @@ python -m robocasa.demos.demo_teleop
 참고: SpaceMouse를 사용하는 경우, `robocasa/macros_private.py`에서 `SPACEMOUSE_PRODUCT_ID`를 사용 중인 모델에 맞게 수정해야 할 수 있습니다.
 
 -------
+## Windows 및 로컬 추가 기능
+
+이 저장소(로컬 개발 브랜치)에는 Windows 환경과 MuJoCo 공식 에셋 연동을 위해 아래 기능이 추가되어 있습니다. upstream [robocasa/robocasa](https://github.com/robocasa/robocasa) 공식 README에는 아직 없을 수 있습니다.
+
+### Windows에서 venv로 설치 (conda 대안)
+
+Anaconda가 없을 때 PowerShell 예시:
+
+```powershell
+cd D:\Github\artzy_github\Robot_Simulation\robocasa
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ..\robosuite
+pip install -e .
+python -m robocasa.scripts.setup_macros
+python -m robocasa.scripts.download_kitchen_assets
+```
+
+실행할 때마다 `.\.venv\Scripts\Activate.ps1`로 가상 환경을 활성화한 뒤 `python`을 사용하세요.
+
+### Windows 화면 뷰어 (pygame)
+
+`opencv-python-headless`(lerobot 등) 때문에 OpenCV 창(`cv2.imshow`)이 동작하지 않는 Windows 환경에서는 **pygame 뷰어**로 자동 전환됩니다.
+
+| 스크립트 | 동작 |
+|----------|------|
+| `python -m robocasa.demos.demo_tasks` | human demo 재생, `Opening viewer (pygame window)...` |
+| `python -m robocasa.demos.demo_teleop` | 키보드/SpaceMouse 텔레오퍼레이션 |
+
+재생·텔레op 종료: 뷰어 창 닫기, 뷰어에서 **Esc/Enter**, 또는 터미널에서 **Enter**.
+
+GUI 없이 영상만 저장:
+
+```powershell
+python -m robocasa.demos.demo_tasks --task TurnOnSinkFaucet --render_offscreen --video_path D:\tmp\robocasa_videos
+```
+
+### demo_tasks 태스크 목록 확장
+
+`demo_tasks`는 atomic 태스크 외에 **Navigation** 태스크(예: `HotDogSetup`, `DeliverStraw`, `GatherTableware`)도 선택할 수 있습니다. 태스크 번호를 입력하면 해당 human demo가 없을 때 자동으로 다운로드를 제안합니다.
+
+### MuJoCo 공식 MJCF 객체 (`mujoco_official`)
+
+[google-deepmind/mujoco](https://github.com/google-deepmind/mujoco) 저장소 `model/`의 MJCF를 RoboCasa 조작 객체로 변환·등록하는 기능입니다.
+
+**upstream 모델 clone (별도 폴더, pip `mujoco` 패키지와 무관):**
+
+```powershell
+git clone --depth 1 --filter=blob:none --sparse https://github.com/google-deepmind/mujoco.git ..\mujoco-models
+cd ..\mujoco-models
+git sparse-checkout set model/mug model/cube model/cards model/cube/assets model/cards/assets
+```
+
+**RoboCasa로 import (mug + playing card 일괄):**
+
+```powershell
+pip install trimesh
+python robocasa/scripts/asset_scripts/import_mujoco_batch.py
+```
+
+변환 결과: `robocasa/models/assets/objects/mujoco_official/`  
+레지스트리: `kitchen_objects.py`의 `mug`, `mujoco_playing_card` → `mujoco_official`
+
+Kitchen 환경에서 MuJoCo 공식 객체만 쓰기:
+
+```python
+from robocasa.utils.env_utils import create_env
+
+env = create_env(
+    "PickPlaceCounterToCabinet",
+    split="pretrain",
+    obj_registries=("mujoco_official",),
+)
+env.reset()
+```
+
+**Rubik's cube 등 articulation 전체 씬**은 Kitchen에 merge하지 않고 별도 sandbox:
+
+```powershell
+python -m robocasa.demos.demo_mujoco_physics --model cube
+python -m robocasa.demos.demo_mujoco_physics --model mug
+```
+
+자세한 인벤토리·제약: [`Analysis/mujoco-mjcf-integration.md`](Analysis/mujoco-mjcf-integration.md)
+
+### 로봇 변경
+
+기본 로봇은 **PandaOmron**입니다. 주방 씬 탐색 시 로봇 지정:
+
+```powershell
+python -m robocasa.demos.demo_kitchen_scenes --robot GR1FixedLowerBody
+```
+
+데모 수집:
+
+```powershell
+python -m robocasa.scripts.collect_demos --environment PickPlaceCounterToCabinet --robots GR1FixedLowerBody
+```
+
+`demo_teleop`은 현재 PandaOmron 고정입니다. GR1 사용 시 `mink` 설치가 필요할 수 있습니다. Gym/정책 학습 파이프라인은 PandaOmron 관측·행동 공간에 맞춰져 있습니다.
+
+### 시작 시 경고 메시지 (무시 가능)
+
+| 메시지 | 의미 |
+|--------|------|
+| `mimicgen environments not imported` | MimicGen 미설치. human demo 재생·텔레op에는 **영향 없음**. 합성 데이터 생성 시에만 필요. |
+| `Could not import robosuite_models` | 추가 로봇 모델 패키지 없음. PandaOmron만 쓰면 **무관**. |
+| `Could not load the mink-based whole-body IK` | GR1 whole-body IK용. PandaOmron만 쓰면 **무관**. |
+
+-------
 ## 태스크, 데이터셋, 정책 학습 및 추가 사용 사례
 태스크, 데이터셋, 벤치마킹 등에 대한 자세한 내용은 [문서 페이지](https://robocasa.ai/docs/introduction/overview.html)를 참고하세요.
 

@@ -51,7 +51,7 @@ class ObjCat:
 
         priority: priority of the object
 
-        reg_type (str): registry type (options: objaverse, aigen_objs, lightwheel)
+        reg_type (str): registry type (options: objaverse, aigen_objs, lightwheel, mujoco_official, coppelia_edu)
 
         auxiliary_obj (str): name of the auxiliary object group (e.g., "saucepan_lid")
 
@@ -172,10 +172,14 @@ for (name, kwargs) in OBJ_CATEGORIES.items():
             "aigen",
             "objaverse",
             "lightwheel",
+            "mujoco_official",
+            "coppelia_edu",
         ]
     objaverse_kwargs = common_properties.pop("objaverse", None)
     aigen_kwargs = common_properties.pop("aigen", None)
     lightwheel_kwargs = common_properties.pop("lightwheel", None)
+    mujoco_official_kwargs = common_properties.pop("mujoco_official", None)
+    coppelia_edu_kwargs = common_properties.pop("coppelia_edu", None)
     assert "scale" not in kwargs
     OBJ_CATEGORIES[name] = {}
 
@@ -194,6 +198,16 @@ for (name, kwargs) in OBJ_CATEGORIES.items():
         lightwheel_kwargs.update(common_properties)
         OBJ_CATEGORIES[name]["lightwheel"] = ObjCat(
             name=name, reg_type="lightwheel", **lightwheel_kwargs
+        )
+    if mujoco_official_kwargs is not None:
+        mujoco_official_kwargs.update(common_properties)
+        OBJ_CATEGORIES[name]["mujoco_official"] = ObjCat(
+            name=name, reg_type="mujoco_official", **mujoco_official_kwargs
+        )
+    if coppelia_edu_kwargs is not None:
+        coppelia_edu_kwargs.update(common_properties)
+        OBJ_CATEGORIES[name]["coppelia_edu"] = ObjCat(
+            name=name, reg_type="coppelia_edu", **coppelia_edu_kwargs
         )
 
 

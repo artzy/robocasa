@@ -126,7 +126,20 @@ v-hacd
 robocasa/models/assets/model_zoo_assets
 
 # object assets
-robocasa/models/assets/objects/**/*.glb
+robocasa/models/assets/objects
+
+# CoppeliaSim export staging (Edu license — local only)
+exports/coppelia_edu/export_config.txt
+exports/coppelia_edu/export_log.txt
+exports/coppelia_edu/**/model.obj
+exports/coppelia_edu/**/*.mtl
+exports/coppelia_edu/**/*.png
+exports/coppelia_edu/**/*.urdf
+exports/coppelia_edu/**/*.dae
+
+# CoppeliaSim converted robots (local)
+robocasa/models/assets/robots/coppelia_edu/**/*.obj
+robocasa/models/assets/robots/coppelia_edu/**/model.urdf
 robocasa/models/assets/objects/**/*.obj
 robocasa/models/assets/objects/**/*.mtl
 robocasa/models/assets/objects/**/*.blend

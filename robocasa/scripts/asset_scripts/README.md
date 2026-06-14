@@ -19,6 +19,47 @@ Import a `.glb` model:
 python robocasa/scripts/asset_scripts/import_glb_model.py --prescale --center --no_cached_coll --path <path-to-glb-model>
 ```
 
+#### `import_mujoco_mjcf.py`
+Import an upstream MuJoCo official MJCF (from [google-deepmind/mujoco](https://github.com/google-deepmind/mujoco) `model/`):
+```
+python robocasa/scripts/asset_scripts/import_mujoco_mjcf.py --src <path-to-mug.xml> --name mujoco_mug
+python robocasa/scripts/asset_scripts/import_mujoco_mjcf.py --src <path-to-cards.xml> --name mujoco_card_2_clubs --body-index 0
+```
+Output goes to `robocasa/models/assets/objects/mujoco_official/<category>/<name>/model.xml`.
+
+Batch import (mug + card):
+```
+python robocasa/scripts/asset_scripts/import_mujoco_batch.py
+```
+
+Register in `kitchen_objects.py` under `mujoco_official=dict(...)` and sample with `obj_registries=("mujoco_official",)`.
+
+#### CoppeliaSim Edu `.ttm` models (`coppelia_edu`)
+
+CoppeliaSim models are not MuJoCo-native; export OBJ from CoppeliaSim then import:
+
+```powershell
+# 1) Export OBJ from CoppeliaSim (headless)
+robocasa/scripts/asset_scripts/run_coppelia_export.ps1
+
+# 2) Import into RoboCasa assets (uses coacd on Windows)
+python robocasa/scripts/asset_scripts/import_coppelia_batch.py
+
+# 3) Verify
+python robocasa/scripts/asset_scripts/verify_coppelia_edu.py
+```
+
+Config: `exports/coppelia_edu/export_config.txt` (see `export_config.example.txt`).
+Output: `robocasa/models/assets/objects/coppelia_edu/`.
+Registry: `cup`, `bowl`, `basket`, `pan` → `coppelia_edu=dict(...)`.
+Fixture pilot: `furniture/tables/diningTable.ttm` → `fixtures/coppelia_edu/tables/coppelia_dining_table/`.
+Robot URDF: `urdf:robots/non-mobile/Dobot Magician.ttm` in export config; verify with `import_coppelia_robot_urdf.py` (DAE mesh conversion may be required for MuJoCo compile).
+
+Articulated upstream scenes (Rubik's cube):
+```
+python -m robocasa.demos.demo_mujoco_physics --model cube
+```
+
 ## Inspecting objects
 #### `browse_mjcf_model.py`
 Visualize the assets interactively:

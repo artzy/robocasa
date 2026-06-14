@@ -228,6 +228,10 @@ OBJ_CATEGORIES = dict(
                 "bowl_17",  # slow load times
             ],
         ),
+        coppelia_edu=dict(
+            model_folders=["coppelia_edu/household"],
+            scale=1.0,
+        ),
     ),
     boxed_drink=dict(
         types=("drink"),
@@ -572,6 +576,10 @@ OBJ_CATEGORIES = dict(
             scale=1.35,
         ),
         objaverse=dict(),
+        coppelia_edu=dict(
+            model_folders=["coppelia_edu/household"],
+            scale=1.0,
+        ),
     ),
     cupcake=dict(
         types=("sweets"),
@@ -978,6 +986,18 @@ OBJ_CATEGORIES = dict(
                 "mug_0",  # too dark
             ],
         ),
+        mujoco_official=dict(
+            model_folders=["mujoco_official/mug"],
+            scale=1.0,
+        ),
+    ),
+    mujoco_playing_card=dict(
+        types=("packaged_food",),
+        graspable=True,
+        mujoco_official=dict(
+            model_folders=["mujoco_official/cards"],
+            scale=1.0,
+        ),
     ),
     mushroom=dict(
         types=("vegetable"),
@@ -1056,6 +1076,10 @@ OBJ_CATEGORIES = dict(
                 "pan_22",  # these are technically what we consider "pots"
                 "pan_9",  # collision model for bottom of pan is too thin
             ],
+        ),
+        coppelia_edu=dict(
+            model_folders=["coppelia_edu/kitchenware"],
+            scale=1.0,
         ),
     ),
     pot=dict(
@@ -2875,6 +2899,10 @@ OBJ_CATEGORIES = dict(
         freezable=False,
         lightwheel=dict(
             scale=0.85,
+        ),
+        coppelia_edu=dict(
+            model_folders=["coppelia_edu/household"],
+            scale=1.0,
         ),
     ),
     placemat=dict(
