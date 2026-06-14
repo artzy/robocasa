@@ -49,20 +49,24 @@ def choose_option(
     print()
     try:
         s = input(
-            "Choose an option 0 to {}, or any other key for default ({}): ".format(
+            "Choose an option 0 to {}, [q] to quit, or any other key for default ({}): ".format(
                 len(options) - 1,
                 default_message,
             )
         )
+        if s.strip().lower() == "q":
+            return None
         # parse input into a number within range
         k = min(max(int(s), 0), len(options) - 1)
         choice = list(options.keys())[k]
-    except:
+    except ValueError:
         if default is None:
             choice = options[0]
         else:
             choice = default
         print("Use {} by default.\n".format(choice))
+    except (EOFError, KeyboardInterrupt):
+        return None
 
     # Return the chosen environment name
     return choice
@@ -133,6 +137,8 @@ if __name__ == "__main__":
             task = choose_option(
                 tasks, "task", default=list(tasks.keys())[0], show_keys=True
             )
+            if task is None:
+                break
         else:
             task = args.task
         video_num += 1

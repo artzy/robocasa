@@ -6,25 +6,34 @@ import numpy as np
 
 
 def _stdin_ready():
-    """Return True when Enter was pressed in the terminal (non-blocking)."""
+    """Return True when Enter or q was pressed in the terminal (non-blocking)."""
     if sys.platform == "win32":
         import msvcrt
 
         if not msvcrt.kbhit():
             return False
         ch = msvcrt.getwch()
-        if ch in ("\r", "\n"):
+        if ch in ("\r", "\n", "q", "Q"):
             return True
         # Drain remaining chars until Enter for pasted/multi-key input.
         while msvcrt.kbhit():
             ch = msvcrt.getwch()
-            if ch in ("\r", "\n"):
+            if ch in ("\r", "\n", "q", "Q"):
                 return True
         return False
 
     import select
 
-    return bool(select.select([sys.stdin], [], [], 0)[0])
+    if not select.select([sys.stdin], [], [], 0)[0]:
+        return False
+    ch = sys.stdin.read(1)
+    if ch in ("\r", "\n", "q", "Q"):
+        return True
+    while select.select([sys.stdin], [], [], 0)[0]:
+        ch = sys.stdin.read(1)
+        if ch in ("\r", "\n"):
+            return True
+    return False
 
 
 class PygamePlaybackViewer:
@@ -58,6 +67,7 @@ class PygamePlaybackViewer:
                 pg.K_ESCAPE,
                 pg.K_RETURN,
                 pg.K_KP_ENTER,
+                pg.K_q,
             ):
                 self._should_close = True
 
@@ -102,8 +112,6 @@ class PygamePlaybackViewer:
         while not self._should_close:
             self._handle_events()
             if _stdin_ready():
-                if sys.platform != "win32":
-                    sys.stdin.readline()
                 self._should_close = True
                 break
             if sim is not None:

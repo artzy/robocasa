@@ -174,8 +174,8 @@ def playback_trajectory_with_env(
         if pygame_viewer is not None:
             print(
                 colored(
-                    "Close the window, press Esc/Enter in the viewer, "
-                    "or press Enter in the terminal.",
+                    "Close the window, press Esc/Enter/q in the viewer, "
+                    "or press Enter/q in the terminal.",
                     "green",
                 )
             )
