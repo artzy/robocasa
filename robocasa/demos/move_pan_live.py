@@ -37,8 +37,8 @@ from robocasa.wrappers.enclosing_wall_render_wrapper import (
 )
 
 CAMERA_NAME_TELEOP = "robot0_frontview"
-CAMERA_WIDTH = 768
-CAMERA_HEIGHT = 512
+CAMERA_WIDTH = 1536
+CAMERA_HEIGHT = 1024
 PREVIEW_FPS = 20
 
 PREVIEW_DEFAULT_LAYOUT = 15
