@@ -87,6 +87,7 @@ def import_mesh_obj(
 
         shutil.rmtree(out_dir)
 
+    grasp_sidecar = src_obj.parent / "grasp_point.json"
     cmd = [
         sys.executable,
         str(import_mesh),
@@ -105,6 +106,8 @@ def import_mesh_obj(
         "--scale",
         str(scale),
     ]
+    if grasp_sidecar.exists():
+        cmd.extend(["--grasp_sidecar", str(grasp_sidecar)])
     subprocess.run(cmd, check=True)
     return out_dir
 

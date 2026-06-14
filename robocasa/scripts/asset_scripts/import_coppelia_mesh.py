@@ -6,8 +6,10 @@ Uses coacd for convex collision decomposition on Windows (VHACD/TestVHACD option
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import coacd
@@ -17,6 +19,76 @@ from termcolor import colored
 
 import robocasa.utils.model_zoo.mjcf_gen_utils as MJCFGenUtils
 import robocasa.utils.model_zoo.parser_utils as ParserUtils
+
+
+def _load_mesh_from_obj(src_obj: Path) -> trimesh.Trimesh:
+    mesh = trimesh.load(src_obj, force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+    return mesh
+
+
+def _mesh_bbox_center(mesh: trimesh.Trimesh) -> np.ndarray:
+    return (mesh.bounds[0] + mesh.bounds[1]) / 2.0
+
+
+def _load_grasp_sidecar(sidecar_path: Path) -> dict | None:
+    if not sidecar_path.exists():
+        return None
+    with sidecar_path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _grasp_pos_in_mjcf(
+    sidecar: dict,
+    center: np.ndarray,
+) -> np.ndarray:
+    """Map exported world-frame graspPoint to centered MJCF body coords."""
+    return np.asarray(sidecar["pos"], dtype=float) - center
+
+
+def _inject_grasp_site(model_xml: Path, grasp_pos_mjcf: np.ndarray) -> None:
+    tree = ET.parse(model_xml)
+    root = tree.getroot()
+    object_body = root.find("./worldbody/body/body[@name='object']")
+    if object_body is None:
+        raise ValueError(f"object body not found in {model_xml}")
+
+    for site in list(object_body.findall("site")):
+        if site.get("name") == "grasp_site":
+            object_body.remove(site)
+
+    pos_str = " ".join(f"{v:.9f}" for v in grasp_pos_mjcf)
+    ET.SubElement(
+        object_body,
+        "site",
+        {
+            "name": "grasp_site",
+            "pos": pos_str,
+            "rgba": "0 0 0 0",
+            "size": "0.004",
+        },
+    )
+    tree.write(model_xml, encoding="utf-8")
+
+
+def _maybe_inject_grasp_site(
+    model_xml: Path,
+    src_obj: Path,
+    *,
+    center: bool,
+    grasp_sidecar: Path | None = None,
+) -> bool:
+    sidecar_path = grasp_sidecar or src_obj.parent / "grasp_point.json"
+    sidecar = _load_grasp_sidecar(sidecar_path)
+    if sidecar is None:
+        return False
+
+    mesh = _load_mesh_from_obj(src_obj)
+    center_vec = _mesh_bbox_center(mesh) if center else np.zeros(3, dtype=float)
+    grasp_pos = _grasp_pos_in_mjcf(sidecar, center_vec)
+    _inject_grasp_site(model_xml, grasp_pos)
+    return True
 
 
 def _decompose_coacd(mesh: trimesh.Trimesh, coll_dir: Path, max_hulls: int = 16) -> None:
@@ -49,6 +121,7 @@ def import_coppelia_obj(
     prescale: bool = False,
     center: bool = True,
     verbose: bool = False,
+    grasp_sidecar: Path | None = None,
 ) -> Path:
     if output_path.exists():
         shutil.rmtree(output_path)
@@ -83,7 +156,15 @@ def import_coppelia_obj(
         sc=scale,
         verbose=verbose,
     )
-    return output_path / "model.xml"
+    model_xml = output_path / "model.xml"
+    if _maybe_inject_grasp_site(
+        model_xml,
+        src_obj,
+        center=center,
+        grasp_sidecar=grasp_sidecar,
+    ):
+        print(colored(f"Injected grasp_site into {model_xml}", color="cyan"))
+    return model_xml
 
 
 def main():
@@ -114,6 +195,12 @@ def main():
     )
     parser.add_argument("--center", type=str, nargs="?", const="False", default="True")
     parser.add_argument("--prescale", type=str, nargs="?", const="False", default="False")
+    parser.add_argument(
+        "--grasp_sidecar",
+        type=str,
+        default=None,
+        help="Optional grasp_point.json from CoppeliaSim export.",
+    )
     args = parser.parse_args()
 
     model_name = args.model_name or Path(args.path).stem
@@ -126,6 +213,7 @@ def main():
         prescale=args.prescale not in ("False", "false", False),
         center=args.center not in ("False", "false", False),
         verbose=args.verbose,
+        grasp_sidecar=Path(args.grasp_sidecar) if args.grasp_sidecar else None,
     )
     print(colored(f"Model output to: {out}", color="green"))
 

@@ -10,12 +10,17 @@ import numpy as np
 import robocasa
 from robocasa.demos.demo_pan_move_sandbox import DEFAULT_PAN_MJCF, PanMoveSandboxEnv
 from robocasa.demos.move_pan_live import (
-    MAX_PAN_EEF_ATTACH_DIST,
-    _build_move_pan_timeline,
-    _compute_target_pan_pose,
+    DEFAULT_HOME_PRESET,
+    HOME_BASE_TOLERANCE,
+    HOME_EEF_TOLERANCE,
+    MAX_GRASP_SITE_ATTACH_DIST,
+    PAN_GRASP_SITE,
     _generate_preview_states,
     _get_eef_pose,
+    _get_pan_grasp_pose,
     _get_pan_pose,
+    _get_robot_base_pose,
+    load_home_preset,
     make_move_pan_env,
 )
 from robocasa.environments import REGISTERED_KITCHEN_ENVS
@@ -82,7 +87,7 @@ def verify_sandbox() -> None:
     print("OK PanMoveSandboxEnv")
 
 
-def verify_preview_arm_motion(layout: int = 15, style: int = 34, seed: int = 0) -> None:
+def verify_grasp_site(layout: int = 15, style: int = 34, seed: int = 0) -> None:
     env, _, _ = make_move_pan_env(
         teleop=False,
         layout=layout,
@@ -91,38 +96,106 @@ def verify_preview_arm_motion(layout: int = 15, style: int = 34, seed: int = 0) 
         render_offscreen=True,
     )
     env.reset()
-    start_pan, start_quat = _get_pan_pose(env)
-    end_pan, end_quat = _compute_target_pan_pose(env, start_pan, start_quat)
-    home_eef, home_eef_quat, _ = _get_eef_pose(env)
-    timeline = _build_move_pan_timeline(
-        start_pan, end_pan, start_quat, end_quat, home_eef, home_eef_quat
+    site_id = env.sim.model.site_name2id(PAN_GRASP_SITE)
+    assert site_id >= 0
+
+    pan_pos, _ = _get_pan_pose(env)
+    grasp_pos, _, _ = _get_pan_grasp_pose(env)
+    grasp_body_dist = float(np.linalg.norm(grasp_pos - pan_pos))
+    assert grasp_body_dist > 0.05, (
+        f"grasp site should differ from body center ({grasp_body_dist:.3f}m)"
+    )
+    env.close()
+    print(f"OK pan_grasp_site (grasp-body dist {grasp_body_dist:.3f}m)")
+
+
+def verify_home_start_end(layout: int = 15, style: int = 34, seed: int = 0) -> None:
+    home = load_home_preset(DEFAULT_HOME_PRESET)
+    env, _, _ = make_move_pan_env(
+        teleop=False,
+        layout=layout,
+        style=style,
+        seed=seed,
+        render_offscreen=True,
+    )
+    states, _, _ = _generate_preview_states(
+        env,
+        home_preset=DEFAULT_HOME_PRESET,
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture="counter",
+        target_fixture="stove",
     )
 
-    states = _generate_preview_states(env)
-    assert len(states) >= 100
+    for label, state in (("start", states[0]), ("end", states[-1])):
+        reset_to(env, {"states": state})
+        base_pos, _ = _get_robot_base_pose(env)
+        eef_pos, _, _ = _get_eef_pose(env)
+        base_dist = float(np.linalg.norm(base_pos - home.base_pos))
+        eef_dist = float(np.linalg.norm(eef_pos - home.eef_pos))
+        assert base_dist < HOME_BASE_TOLERANCE, (
+            f"{label} base should match home ({base_dist:.3f}m)"
+        )
+        assert eef_dist < HOME_EEF_TOLERANCE, (
+            f"{label} eef should match home ({eef_dist:.3f}m)"
+        )
+
+    env.close()
+    print(
+        f"OK home start/end ({len(states)} frames, "
+        f"preset {DEFAULT_HOME_PRESET.name})"
+    )
+
+
+def verify_preview_arm_motion(layout: int = 15, style: int = 34, seed: int = 0) -> None:
+    env, _, _ = make_move_pan_env(
+        teleop=False,
+        layout=layout,
+        style=style,
+        seed=seed,
+        render_offscreen=True,
+    )
+    states, home, timeline = _generate_preview_states(
+        env,
+        home_preset=DEFAULT_HOME_PRESET,
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture="counter",
+        target_fixture="stove",
+    )
+
+    assert len(states) >= 200
     assert len(states) == len(timeline)
 
-    max_attach_dist = 0.0
+    max_grasp_site_dist = 0.0
     for state, frame in zip(states, timeline):
         if not frame.attach:
             continue
         reset_to(env, {"states": state})
         eef_pos, _, _ = _get_eef_pose(env)
-        pan_pos, _ = _get_pan_pose(env)
-        max_attach_dist = max(max_attach_dist, float(np.linalg.norm(pan_pos - eef_pos)))
+        grasp_pos, _, _ = _get_pan_grasp_pose(env)
+        max_grasp_site_dist = max(
+            max_grasp_site_dist, float(np.linalg.norm(grasp_pos - eef_pos))
+        )
 
-    assert max_attach_dist < MAX_PAN_EEF_ATTACH_DIST, (
-        f"pan should follow gripper during grasp (max dist {max_attach_dist:.3f}m)"
+    assert max_grasp_site_dist < MAX_GRASP_SITE_ATTACH_DIST, (
+        f"eef should align with grasp site during attach "
+        f"(max dist {max_grasp_site_dist:.3f}m)"
     )
 
     reset_to(env, {"states": states[-1]})
     final_eef, _, _ = _get_eef_pose(env)
-    dist = float(np.linalg.norm(final_eef - home_eef))
-    assert dist > 0.05, f"expected arm motion, got {dist:.3f}m"
+    dist = float(np.linalg.norm(final_eef - home.eef_pos))
+    assert dist < HOME_EEF_TOLERANCE, (
+        f"preview should end at home eef (dist {dist:.3f}m)"
+    )
     env.close()
     print(
-        f"OK preview arm motion (eef delta {dist:.2f}m, "
-        f"max grasp dist {max_attach_dist:.3f}m, {len(states)} frames)"
+        f"OK preview arm motion (eef-home delta {dist:.3f}m, "
+        f"max grasp-site dist {max_grasp_site_dist:.3f}m, "
+        f"{len(states)} frames)"
     )
 
 
@@ -134,6 +207,8 @@ def main():
     args = parser.parse_args()
 
     verify_kitchen_move_pan(layout=args.layout, style=args.style, seed=args.seed)
+    verify_grasp_site(layout=args.layout, style=args.style, seed=args.seed)
+    verify_home_start_end(layout=args.layout, style=args.style, seed=args.seed)
     verify_preview_arm_motion(layout=args.layout, style=args.style, seed=args.seed)
     verify_sandbox()
     print("ALL OK")

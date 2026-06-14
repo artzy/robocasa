@@ -97,6 +97,26 @@ env = create_env(
 - [x] URDF export (Dobot Magician)
 - [x] URDF MuJoCo compile (DAE→OBJ, Dobot Magician)
 
+## graspPoint → MJCF grasp_site (MovePan)
+
+CoppeliaSim `frying_pan_01.ttm`의 `graspPoint` dummy를 export/import 파이프라인에서 MJCF `<site name="grasp_site">`로 보존합니다.
+
+```
+frying_pan_01.ttm (graspPoint)
+  → coppelia_export_models.lua → grasp_point.json (world pos)
+  → import_coppelia_mesh.py → model.xml grasp_site (bbox center offset)
+  → MovePan preview: pan_grasp_site 기준 IK/attach
+```
+
+| 단계 | 파일 | 비고 |
+|------|------|------|
+| Export | `coppelia_export_models.lua` | alias index `0`, world-frame `pos` |
+| Sidecar | `exports/.../frying_pan_01/grasp_point.json` | mesh center와 동일 `-center` 적용 |
+| MJCF | `coppelia_frying_pan/model.xml` | sim에서 `pan_grasp_site` |
+| Preview | `move_pan_live.py` | approach/lift는 grasp site, place는 body center |
+
+**주의:** sidecar `pos`는 export OBJ와 동일한 **world frame**이어야 합니다 (model-local이 아님).
+
 ## 다음 단계 (선택)
 
 - robosuite 로봇 등록 (Dobot Magician URDF → Kitchen env 연동)

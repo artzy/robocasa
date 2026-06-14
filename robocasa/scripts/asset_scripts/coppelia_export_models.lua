@@ -112,6 +112,54 @@ local function exportObjLegacy(shapeHandles, outPath)
     return true, nil
 end
 
+local function objectAliasOrName(handle)
+    local alias = sim.getObjectAlias(handle, 0)
+    if alias ~= nil and alias ~= "" then
+        return alias
+    end
+    alias = sim.getObjectAlias(handle, -1)
+    if alias ~= nil and alias ~= "" then
+        return alias
+    end
+    return sim.getObjectName(handle)
+end
+
+local function findGraspPointHandle(modelHandle)
+    local objects = sim.getObjectsInTree(modelHandle, sim.handle_all, 0)
+    for i = 1, #objects, 1 do
+        local h = objects[i]
+        local label = objectAliasOrName(h)
+        if label == "graspPoint" or label:lower() == "grasppoint" then
+            return h
+        end
+        local name = sim.getObjectName(h)
+        if name == "graspPoint" or name:lower() == "grasppoint" then
+            return h
+        end
+    end
+    return nil
+end
+
+local function writeGraspPointSidecar(modelHandle, outDir)
+    local graspHandle = findGraspPointHandle(modelHandle)
+    if graspHandle == nil then
+        return false, "graspPoint not found"
+    end
+    local pos = sim.getObjectPosition(graspHandle, -1)
+    local quat = sim.getObjectQuaternion(graspHandle, modelHandle, sim.handle_local)
+    local outPath = outDir .. "/grasp_point.json"
+    local f, err = io.open(outPath, "w")
+    if not f then
+        return false, "cannot write " .. outPath .. ": " .. tostring(err)
+    end
+    f:write(string.format(
+        '{"name":"graspPoint","pos":[%.9f,%.9f,%.9f],"quat":[%.9f,%.9f,%.9f,%.9f]}\n',
+        pos[1], pos[2], pos[3], quat[1], quat[2], quat[3], quat[4]
+    ))
+    f:close()
+    return true, nil
+end
+
 local function exportUrdf(ttmPath, outDir)
     local modelHandle = sim.loadModel(ttmPath)
     if modelHandle == nil or modelHandle < 0 then
@@ -142,6 +190,12 @@ local function exportModel(ttmPath, outDir)
     local ok, err = exportObjAssimp(shapeHandles, outPath)
     if not ok then
         ok, err = exportObjLegacy(shapeHandles, outPath)
+    end
+    if ok then
+        local graspOk, graspErr = writeGraspPointSidecar(modelHandle, outDir)
+        if not graspOk then
+            print("[coppelia_export] WARN grasp sidecar: " .. tostring(graspErr))
+        end
     end
     sim.removeModel(modelHandle)
     return ok, err

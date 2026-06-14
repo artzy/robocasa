@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import imageio
 import numpy as np
@@ -21,6 +22,7 @@ from robocasa.models.fixtures.fixture import FixtureType
 from robocasa.models.fixtures.fixture_utils import fixture_is_type
 from robocasa.scripts.collect_demos import collect_human_trajectory
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
+from robocasa.utils import env_utils as EnvUtils
 from robocasa.utils.playback_viewer import (
     PygamePlaybackViewer,
     apply_mjviewer_camera_config,
@@ -53,15 +55,28 @@ RETREAT_Z = 0.12
 GRASP_LOCAL_OFFSET = np.array([0.0, 0.0, -0.08])
 GRASP_ATTACH_GRIPPER = 0.85
 MAX_PAN_EEF_ATTACH_DIST = 0.12
+MAX_GRASP_SITE_ATTACH_DIST = 0.10
+PAN_GRASP_SITE = "pan_grasp_site"
 
-PHASE_HOLD_START = 15
+PHASE_HOLD_START = 10
+PHASE_MOVE_TO_PICK = 25
 PHASE_APPROACH = 20
 PHASE_DESCEND = 15
 PHASE_LIFT = 15
-PHASE_TRANSPORT = 50
+PHASE_MOVE_TO_PLACE = 40
 PHASE_PLACE = 15
 PHASE_RETREAT = 10
-PHASE_HOLD_END = 50
+PHASE_RETURN_BASE = 30
+PHASE_RETURN_ARM = 20
+PHASE_HOLD_END = 30
+
+HOME_BASE_TOLERANCE = 0.02
+HOME_EEF_TOLERANCE = 0.05
+
+_DEMO_DIR = Path(__file__).resolve().parent
+DEFAULT_HOME_PRESET = (
+    _DEMO_DIR / "move_pan_home_presets" / "default_layout15_seed0.json"
+)
 
 IK_POS_TOL = 0.015
 IK_MAX_ITERS = 40
@@ -105,7 +120,7 @@ def _compute_preview_cam_config(env):
 
 def make_move_pan_env(
     source_fixture: str = "counter",
-    target_fixture: str = "sink",
+    target_fixture: str = "stove",
     obj_registries: tuple[str, ...] = ("coppelia_edu",),
     layout: int | None = None,
     style: int | None = None,
@@ -256,6 +271,65 @@ def _get_pan_pose(env):
     return pos, quat
 
 
+def _get_grasp_site_local(env) -> np.ndarray | None:
+    try:
+        site_id = env.sim.model.site_name2id(PAN_GRASP_SITE)
+    except Exception:
+        return None
+    return np.array(env.sim.model.site_pos[site_id], dtype=float)
+
+
+def _get_pan_grasp_pose(env):
+    """World grasp site pose; falls back to pan body center when site is missing."""
+    try:
+        site_id = env.sim.model.site_name2id(PAN_GRASP_SITE)
+        pos = np.array(env.sim.data.site_xpos[site_id], dtype=float)
+        mat = env.sim.data.site_xmat[site_id].reshape(3, 3)
+        quat_xyzw = T.mat2quat(mat)
+        quat = T.convert_quat(quat_xyzw, to="wxyz")
+        return pos, quat, mat
+    except Exception:
+        pos, quat = _get_pan_pose(env)
+        mat = T.quat2mat(T.convert_quat(quat, to="xyzw"))
+        return pos, quat, mat
+
+
+def _grasp_world_from_body(
+    body_pos: np.ndarray, body_quat: np.ndarray, grasp_local: np.ndarray
+) -> np.ndarray:
+    body_mat = T.quat2mat(T.convert_quat(body_quat, to="xyzw"))
+    return body_pos + body_mat @ grasp_local
+
+
+def _body_pos_from_grasp_world(
+    grasp_world: np.ndarray, body_quat: np.ndarray, grasp_local: np.ndarray
+) -> np.ndarray:
+    body_mat = T.quat2mat(T.convert_quat(body_quat, to="xyzw"))
+    return grasp_world - body_mat @ grasp_local
+
+
+def _compute_side_grasp_quat(pan_quat: np.ndarray, fallback_quat: np.ndarray) -> np.ndarray:
+    """Orient gripper for a side grasp on the pan handle (+X body axis)."""
+    try:
+        body_mat = T.quat2mat(T.convert_quat(pan_quat, to="xyzw"))
+        handle_axis = body_mat[:, 0]
+        handle_axis = handle_axis / max(np.linalg.norm(handle_axis), 1e-9)
+        down = np.array([0.0, 0.0, -1.0])
+        y_axis = handle_axis - down * np.dot(handle_axis, down)
+        y_norm = np.linalg.norm(y_axis)
+        if y_norm < 1e-6:
+            return fallback_quat.copy()
+        y_axis /= y_norm
+        z_axis = down
+        x_axis = np.cross(y_axis, z_axis)
+        x_axis /= max(np.linalg.norm(x_axis), 1e-9)
+        rot_mat = np.column_stack([x_axis, y_axis, z_axis])
+        quat_xyzw = T.mat2quat(rot_mat)
+        return T.convert_quat(quat_xyzw, to="wxyz")
+    except Exception:
+        return fallback_quat.copy()
+
+
 def _set_pan_pose(env, pos, quat):
     pan = env.objects["pan"]
     env.sim.data.set_joint_qpos(pan.joints[0], np.concatenate([pos, quat]))
@@ -278,12 +352,18 @@ def _eef_local_to_world(eef_pos: np.ndarray, eef_mat: np.ndarray, local_offset: 
     return eef_pos + eef_mat @ local_offset
 
 
-def _snap_pan_to_gripper(env, pan_quat: np.ndarray, local_offset: np.ndarray | None = None):
-    """Place pan at a fixed offset from the gripper site (grasp snap)."""
+def _snap_pan_to_gripper(
+    env,
+    pan_quat: np.ndarray,
+    grasp_local: np.ndarray,
+    local_offset: np.ndarray | None = None,
+):
+    """Align grasp site to gripper offset, then solve pan body root pose."""
     if local_offset is None:
         local_offset = GRASP_LOCAL_OFFSET.copy()
     eef_pos, _, eef_mat = _get_eef_pose(env)
-    pan_pos = _eef_local_to_world(eef_pos, eef_mat, local_offset)
+    grasp_world = _eef_local_to_world(eef_pos, eef_mat, local_offset)
+    pan_pos = _body_pos_from_grasp_world(grasp_world, pan_quat, grasp_local)
     _set_pan_pose(env, pan_pos, pan_quat)
     return local_offset.copy()
 
@@ -354,6 +434,214 @@ def _solve_eef_pose(
     return np.linalg.norm(target_pos - sim.data.site_xpos[site_id]) < pos_tol * 3.0
 
 
+def _lerp_yaw(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
+    az = float(a[2])
+    bz = float(b[2])
+    diff = (bz - az + np.pi) % (2.0 * np.pi) - np.pi
+    out = np.array(a, dtype=float).copy()
+    out[2] = az + _smoothstep(alpha) * diff
+    return out
+
+
+@dataclass
+class MovePanHomePose:
+    base_pos: np.ndarray
+    base_ori: np.ndarray
+    eef_pos: np.ndarray
+    eef_quat: np.ndarray
+    gripper: float = 0.0
+    name: str = ""
+    layout: int | None = None
+    style: int | None = None
+    seed: int | None = None
+    source_fixture: str | None = None
+    target_fixture: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "layout": self.layout,
+            "style": self.style,
+            "seed": self.seed,
+            "source_fixture": self.source_fixture,
+            "target_fixture": self.target_fixture,
+            "base_pos": self.base_pos.tolist(),
+            "base_yaw": float(self.base_ori[2]),
+            "eef_pos": self.eef_pos.tolist(),
+            "eef_quat_wxyz": self.eef_quat.tolist(),
+            "gripper": float(self.gripper),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MovePanHomePose:
+        base_yaw = float(data.get("base_yaw", 0.0))
+        return cls(
+            name=str(data.get("name", "")),
+            layout=data.get("layout"),
+            style=data.get("style"),
+            seed=data.get("seed"),
+            source_fixture=data.get("source_fixture"),
+            target_fixture=data.get("target_fixture"),
+            base_pos=np.asarray(data["base_pos"], dtype=float),
+            base_ori=np.array([0.0, 0.0, base_yaw], dtype=float),
+            eef_pos=np.asarray(data["eef_pos"], dtype=float),
+            eef_quat=np.asarray(data["eef_quat_wxyz"], dtype=float),
+            gripper=float(data.get("gripper", 0.0)),
+        )
+
+
+def load_home_preset(path: Path | str) -> MovePanHomePose:
+    preset_path = Path(path)
+    with preset_path.open(encoding="utf-8") as f:
+        return MovePanHomePose.from_dict(json.load(f))
+
+
+def save_home_preset(home: MovePanHomePose, path: Path | str) -> Path:
+    preset_path = Path(path)
+    preset_path.parent.mkdir(parents=True, exist_ok=True)
+    with preset_path.open("w", encoding="utf-8") as f:
+        json.dump(home.to_dict(), f, indent=2)
+        f.write("\n")
+    return preset_path
+
+
+def capture_home_from_env(
+    env,
+    *,
+    name: str = "",
+    layout: int | None = None,
+    style: int | None = None,
+    seed: int | None = None,
+    source_fixture: str | None = None,
+    target_fixture: str | None = None,
+) -> MovePanHomePose:
+    base_pos, base_ori = _get_robot_base_pose(env)
+    eef_pos, eef_quat, _ = _get_eef_pose(env)
+    return MovePanHomePose(
+        name=name,
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture=source_fixture,
+        target_fixture=target_fixture,
+        base_pos=base_pos.copy(),
+        base_ori=base_ori.copy(),
+        eef_pos=eef_pos.copy(),
+        eef_quat=eef_quat.copy(),
+        gripper=0.0,
+    )
+
+
+def _warn_home_mismatch(
+    home: MovePanHomePose,
+    *,
+    layout: int | None,
+    style: int | None,
+    seed: int | None,
+    source_fixture: str,
+    target_fixture: str,
+) -> None:
+    checks = (
+        ("layout", home.layout, layout),
+        ("style", home.style, style),
+        ("seed", home.seed, seed),
+        ("source_fixture", home.source_fixture, source_fixture),
+        ("target_fixture", home.target_fixture, target_fixture),
+    )
+    mismatches = [
+        f"{name}: preset={preset!r} runtime={runtime!r}"
+        for name, preset, runtime in checks
+        if preset is not None and runtime is not None and preset != runtime
+    ]
+    if mismatches:
+        print(
+            colored(
+                "warning: home preset metadata mismatch — "
+                + "; ".join(mismatches),
+                "yellow",
+            )
+        )
+
+
+def _resolve_home_pose(
+    env,
+    preset_path: Path | str | None,
+    *,
+    layout: int | None,
+    style: int | None,
+    seed: int | None,
+    source_fixture: str,
+    target_fixture: str,
+) -> MovePanHomePose:
+    path = Path(preset_path) if preset_path is not None else DEFAULT_HOME_PRESET
+    if path.exists():
+        home = load_home_preset(path)
+        _warn_home_mismatch(
+            home,
+            layout=layout,
+            style=style,
+            seed=seed,
+            source_fixture=source_fixture,
+            target_fixture=target_fixture,
+        )
+        return home
+
+    print(
+        colored(
+            f"warning: home preset not found ({path}); using reset pose snapshot",
+            "yellow",
+        )
+    )
+    return capture_home_from_env(
+        env,
+        name="reset_snapshot",
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture=source_fixture,
+        target_fixture=target_fixture,
+    )
+
+
+def _apply_home_pose(
+    env,
+    home: MovePanHomePose,
+    open_gripper_qpos: np.ndarray,
+) -> bool:
+    _set_robot_base_pose(env, home.base_pos, home.base_ori)
+    ik_ok = _solve_eef_pose(env, home.eef_pos, home.eef_quat)
+    _set_gripper(env, home.gripper, open_gripper_qpos)
+    env.sim.forward()
+    if hasattr(env, "update_state"):
+        env.update_state()
+    return ik_ok
+
+
+def _get_robot_base_pose(env):
+    base_env = _resolve_base_env(env)
+    body_id = base_env.sim.model.body_name2id("mobilebase0_base")
+    pos = np.array(base_env.sim.data.body_xpos[body_id], dtype=float)
+    ori = T.mat2euler(base_env.sim.data.body_xmat[body_id].reshape(3, 3))
+    return pos, ori
+
+
+def _compute_robot_base_near_fixture(env, fixture):
+    base_env = _resolve_base_env(env)
+    return EnvUtils.compute_robot_base_placement_pose(
+        base_env, fixture, ref_object="pan"
+    )
+
+
+def _set_robot_base_pose(env, global_pos: np.ndarray, global_ori: np.ndarray):
+    base_env = _resolve_base_env(env)
+    EnvUtils.set_robot_to_position(base_env, global_pos)
+    yaw_addr = base_env.sim.model.get_joint_qpos_addr("mobilebase0_joint_mobile_yaw")
+    base_env.sim.data.qpos[yaw_addr] = (
+        float(global_ori[2]) - float(base_env.init_robot_base_ori_anchor[2])
+    )
+    base_env.sim.forward()
+
+
 def _compute_target_pan_pose(env, start_pos, start_quat):
     end_pos = start_pos.copy()
     target = env.target
@@ -369,7 +657,9 @@ def _compute_target_pan_pose(env, start_pos, start_quat):
 
     if fixture_is_type(target, FixtureType.SINK):
         end_pos[2] = min(end_pos[2], start_pos[2] - 0.03)
-    elif fixture_is_type(target, (FixtureType.COUNTER, FixtureType.STOVE)):
+    elif fixture_is_type(target, FixtureType.COUNTER) or fixture_is_type(
+        target, FixtureType.STOVE
+    ):
         end_pos[2] = start_pos[2]
 
     return end_pos, start_quat
@@ -383,6 +673,44 @@ class _PreviewFrame:
     pan_pos: np.ndarray
     pan_quat: np.ndarray
     attach: bool
+    base_pos: np.ndarray | None = None
+    base_ori: np.ndarray | None = None
+
+
+def _collect_preview_timeline_inputs(env, home: MovePanHomePose):
+    base_env = _resolve_base_env(env)
+    start_pan, start_quat = _get_pan_pose(env)
+    start_grasp, _, _ = _get_pan_grasp_pose(env)
+    grasp_local = _get_grasp_site_local(env)
+    end_pan, end_quat = _compute_target_pan_pose(env, start_pan, start_quat)
+    home_eef_pos = home.eef_pos.copy()
+    home_eef_quat = home.eef_quat.copy()
+    pick_grasp_quat = _compute_side_grasp_quat(start_quat, home_eef_quat)
+    home_base_pos = home.base_pos.copy()
+    home_base_ori = home.base_ori.copy()
+    pick_base_pos, pick_base_ori = _compute_robot_base_near_fixture(
+        env, base_env.source
+    )
+    place_base_pos, place_base_ori = _compute_robot_base_near_fixture(
+        env, base_env.target
+    )
+    return dict(
+        start_pan=start_pan,
+        start_grasp=start_grasp,
+        grasp_local=grasp_local,
+        end_pan=end_pan,
+        start_quat=start_quat,
+        end_quat=end_quat,
+        home_eef_pos=home_eef_pos,
+        home_eef_quat=home_eef_quat,
+        pick_grasp_quat=pick_grasp_quat,
+        home_base_pos=home_base_pos,
+        home_base_ori=home_base_ori,
+        pick_base_pos=pick_base_pos,
+        pick_base_ori=pick_base_ori,
+        place_base_pos=place_base_pos,
+        place_base_ori=place_base_ori,
+    )
 
 
 def _build_move_pan_timeline(
@@ -392,15 +720,38 @@ def _build_move_pan_timeline(
     end_quat: np.ndarray,
     home_eef_pos: np.ndarray,
     home_eef_quat: np.ndarray,
+    home_base_pos: np.ndarray,
+    home_base_ori: np.ndarray,
+    pick_base_pos: np.ndarray,
+    pick_base_ori: np.ndarray,
+    place_base_pos: np.ndarray,
+    place_base_ori: np.ndarray,
+    start_grasp: np.ndarray | None = None,
+    grasp_local: np.ndarray | None = None,
+    pick_grasp_quat: np.ndarray | None = None,
 ) -> list[_PreviewFrame]:
     frames: list[_PreviewFrame] = []
 
-    approach_target = start_pan + np.array([0.0, 0.0, APPROACH_Z])
-    descend_target = start_pan + np.array([0.0, 0.0, GRASP_Z_OFFSET])
-    lift_target = start_pan + np.array([0.0, 0.0, LIFT_Z])
-    end_hover = end_pan + np.array([0.0, 0.0, LIFT_Z])
-    place_down = end_pan + np.array([0.0, 0.0, PLACE_Z])
-    retreat_target = end_pan + np.array([0.0, 0.0, RETREAT_Z])
+    if start_grasp is None:
+        start_grasp = start_pan.copy()
+    pick_eef_quat = (
+        pick_grasp_quat.copy()
+        if pick_grasp_quat is not None
+        else home_eef_quat.copy()
+    )
+
+    approach_target = start_grasp + np.array([0.0, 0.0, APPROACH_Z])
+    descend_target = start_grasp + np.array([0.0, 0.0, GRASP_Z_OFFSET])
+    lift_target = start_grasp + np.array([0.0, 0.0, LIFT_Z])
+    pick_hover = start_grasp + np.array([0.0, 0.0, LIFT_Z])
+
+    if grasp_local is not None:
+        end_grasp = _grasp_world_from_body(end_pan, end_quat, grasp_local)
+    else:
+        end_grasp = end_pan.copy()
+    place_hover = end_grasp + np.array([0.0, 0.0, LIFT_Z])
+    place_down = end_grasp + np.array([0.0, 0.0, PLACE_Z])
+    retreat_target = end_grasp + np.array([0.0, 0.0, RETREAT_Z])
 
     def add_frame(**kwargs):
         frames.append(_PreviewFrame(**kwargs))
@@ -413,17 +764,34 @@ def _build_move_pan_timeline(
             pan_pos=start_pan.copy(),
             pan_quat=start_quat.copy(),
             attach=False,
+            base_pos=home_base_pos.copy(),
+            base_ori=home_base_ori.copy(),
+        )
+
+    for i in range(PHASE_MOVE_TO_PICK):
+        t = (i + 1) / PHASE_MOVE_TO_PICK
+        add_frame(
+            eef_pos=home_eef_pos.copy(),
+            eef_quat=home_eef_quat.copy(),
+            gripper=0.0,
+            pan_pos=start_pan.copy(),
+            pan_quat=start_quat.copy(),
+            attach=False,
+            base_pos=_lerp_vec(home_base_pos, pick_base_pos, t),
+            base_ori=_lerp_yaw(home_base_ori, pick_base_ori, t),
         )
 
     for i in range(PHASE_APPROACH):
         t = (i + 1) / PHASE_APPROACH
         add_frame(
             eef_pos=_lerp_vec(home_eef_pos, approach_target, t),
-            eef_quat=home_eef_quat.copy(),
+            eef_quat=pick_eef_quat.copy(),
             gripper=0.0,
             pan_pos=start_pan.copy(),
             pan_quat=start_quat.copy(),
             attach=False,
+            base_pos=pick_base_pos.copy(),
+            base_ori=pick_base_ori.copy(),
         )
 
     for i in range(PHASE_DESCEND):
@@ -431,58 +799,69 @@ def _build_move_pan_timeline(
         gripper = _lerp_scalar(0.0, 1.0, t)
         add_frame(
             eef_pos=_lerp_vec(approach_target, descend_target, t),
-            eef_quat=home_eef_quat.copy(),
+            eef_quat=pick_eef_quat.copy(),
             gripper=gripper,
             pan_pos=start_pan.copy(),
             pan_quat=start_quat.copy(),
             attach=gripper >= GRASP_ATTACH_GRIPPER,
+            base_pos=pick_base_pos.copy(),
+            base_ori=pick_base_ori.copy(),
         )
 
     for i in range(PHASE_LIFT):
         t = (i + 1) / PHASE_LIFT
         add_frame(
             eef_pos=_lerp_vec(descend_target, lift_target, t),
-            eef_quat=home_eef_quat.copy(),
+            eef_quat=pick_eef_quat.copy(),
             gripper=1.0,
             pan_pos=start_pan.copy(),
             pan_quat=start_quat.copy(),
             attach=True,
+            base_pos=pick_base_pos.copy(),
+            base_ori=pick_base_ori.copy(),
         )
 
-    for i in range(PHASE_TRANSPORT):
-        t = (i + 1) / PHASE_TRANSPORT
+    for i in range(PHASE_MOVE_TO_PLACE):
+        t = (i + 1) / PHASE_MOVE_TO_PLACE
         add_frame(
-            eef_pos=_lerp_vec(lift_target, end_hover, t),
-            eef_quat=home_eef_quat.copy(),
+            eef_pos=_lerp_vec(pick_hover, place_hover, t),
+            eef_quat=pick_eef_quat.copy(),
             gripper=1.0,
             pan_pos=end_pan.copy(),
             pan_quat=end_quat.copy(),
             attach=True,
+            base_pos=_lerp_vec(pick_base_pos, place_base_pos, t),
+            base_ori=_lerp_yaw(pick_base_ori, place_base_ori, t),
         )
 
     for i in range(PHASE_PLACE):
         t = (i + 1) / PHASE_PLACE
         add_frame(
-            eef_pos=_lerp_vec(end_hover, place_down, t),
-            eef_quat=home_eef_quat.copy(),
+            eef_pos=_lerp_vec(place_hover, place_down, t),
+            eef_quat=pick_eef_quat.copy(),
             gripper=_lerp_scalar(1.0, 0.0, t),
             pan_pos=end_pan.copy(),
             pan_quat=end_quat.copy(),
             attach=t < 0.55,
+            base_pos=place_base_pos.copy(),
+            base_ori=place_base_ori.copy(),
         )
 
     for i in range(PHASE_RETREAT):
         t = (i + 1) / PHASE_RETREAT
         add_frame(
             eef_pos=_lerp_vec(place_down, retreat_target, t),
-            eef_quat=home_eef_quat.copy(),
+            eef_quat=pick_eef_quat.copy(),
             gripper=0.0,
             pan_pos=end_pan.copy(),
             pan_quat=end_quat.copy(),
             attach=False,
+            base_pos=place_base_pos.copy(),
+            base_ori=place_base_ori.copy(),
         )
 
-    for _ in range(PHASE_HOLD_END):
+    for i in range(PHASE_RETURN_BASE):
+        t = (i + 1) / PHASE_RETURN_BASE
         add_frame(
             eef_pos=retreat_target.copy(),
             eef_quat=home_eef_quat.copy(),
@@ -490,6 +869,33 @@ def _build_move_pan_timeline(
             pan_pos=end_pan.copy(),
             pan_quat=end_quat.copy(),
             attach=False,
+            base_pos=_lerp_vec(place_base_pos, home_base_pos, t),
+            base_ori=_lerp_yaw(place_base_ori, home_base_ori, t),
+        )
+
+    for i in range(PHASE_RETURN_ARM):
+        t = (i + 1) / PHASE_RETURN_ARM
+        add_frame(
+            eef_pos=_lerp_vec(retreat_target, home_eef_pos, t),
+            eef_quat=home_eef_quat.copy(),
+            gripper=0.0,
+            pan_pos=end_pan.copy(),
+            pan_quat=end_quat.copy(),
+            attach=False,
+            base_pos=home_base_pos.copy(),
+            base_ori=home_base_ori.copy(),
+        )
+
+    for _ in range(PHASE_HOLD_END):
+        add_frame(
+            eef_pos=home_eef_pos.copy(),
+            eef_quat=home_eef_quat.copy(),
+            gripper=0.0,
+            pan_pos=end_pan.copy(),
+            pan_quat=end_quat.copy(),
+            attach=False,
+            base_pos=home_base_pos.copy(),
+            base_ori=home_base_ori.copy(),
         )
 
     return frames
@@ -500,10 +906,13 @@ def _apply_preview_frame(
     frame: _PreviewFrame,
     *,
     open_gripper_qpos: np.ndarray,
-    pan_local_offset: np.ndarray | None,
+    grasp_local: np.ndarray | None,
     ik_warned: list[bool],
     degraded: list[bool],
-) -> np.ndarray | None:
+) -> None:
+    if frame.base_pos is not None and frame.base_ori is not None:
+        _set_robot_base_pose(env, frame.base_pos, frame.base_ori)
+
     ik_ok = _solve_eef_pose(env, frame.eef_pos, frame.eef_quat)
     if not ik_ok:
         degraded[0] = True
@@ -518,49 +927,69 @@ def _apply_preview_frame(
 
     _set_gripper(env, frame.gripper, open_gripper_qpos)
 
-    if frame.attach:
-        if pan_local_offset is None:
-            pan_local_offset = _snap_pan_to_gripper(env, frame.pan_quat)
-        else:
-            eef_pos, _, eef_mat = _get_eef_pose(env)
-            pan_pos = _eef_local_to_world(eef_pos, eef_mat, pan_local_offset)
-            _set_pan_pose(env, pan_pos, frame.pan_quat)
+    if frame.attach and grasp_local is not None:
+        eef_pos, _, eef_mat = _get_eef_pose(env)
+        grasp_world = _eef_local_to_world(eef_pos, eef_mat, GRASP_LOCAL_OFFSET)
+        pan_pos = _body_pos_from_grasp_world(grasp_world, frame.pan_quat, grasp_local)
+        _set_pan_pose(env, pan_pos, frame.pan_quat)
+    elif frame.attach:
+        eef_pos, _, eef_mat = _get_eef_pose(env)
+        pan_pos = _eef_local_to_world(eef_pos, eef_mat, GRASP_LOCAL_OFFSET)
+        _set_pan_pose(env, pan_pos, frame.pan_quat)
     else:
         _set_pan_pose(env, frame.pan_pos, frame.pan_quat)
-        if frame.gripper < 0.05:
-            pan_local_offset = None
 
     env.sim.forward()
     if hasattr(env, "update_state"):
         env.update_state()
-    return pan_local_offset
 
 
-def _generate_preview_states(env):
+def _generate_preview_states(
+    env,
+    *,
+    home_preset: Path | str | None = None,
+    layout: int | None = None,
+    style: int | None = None,
+    seed: int | None = None,
+    source_fixture: str = "counter",
+    target_fixture: str = "stove",
+):
     """Build scripted pick-place trajectory with arm IK for demo playback."""
     env.reset()
     _print_instruction(env)
 
-    start_pan, start_quat = _get_pan_pose(env)
-    end_pan, end_quat = _compute_target_pan_pose(env, start_pan, start_quat)
-    home_eef_pos, home_eef_quat, _ = _get_eef_pose(env)
     open_gripper_qpos = _resolve_robot(env).get_gripper_joint_positions("right").copy()
-
-    timeline = _build_move_pan_timeline(
-        start_pan, end_pan, start_quat, end_quat, home_eef_pos, home_eef_quat
+    home = _resolve_home_pose(
+        env,
+        home_preset,
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture=source_fixture,
+        target_fixture=target_fixture,
     )
+    if not _apply_home_pose(env, home, open_gripper_qpos):
+        print(
+            colored(
+                "warning: home pose IK did not fully converge at start",
+                "yellow",
+            )
+        )
+
+    timeline_inputs = _collect_preview_timeline_inputs(env, home)
+    timeline = _build_move_pan_timeline(**timeline_inputs)
 
     states = []
-    pan_local_offset = None
     ik_warned = [False]
     degraded = [False]
+    grasp_local = timeline_inputs.get("grasp_local")
 
     for frame in timeline:
-        pan_local_offset = _apply_preview_frame(
+        _apply_preview_frame(
             env,
             frame,
             open_gripper_qpos=open_gripper_qpos,
-            pan_local_offset=pan_local_offset,
+            grasp_local=grasp_local,
             ik_warned=ik_warned,
             degraded=degraded,
         )
@@ -574,7 +1003,7 @@ def _generate_preview_states(env):
             )
         )
 
-    return np.array(states)
+    return np.array(states), home, timeline
 
 
 def _play_state_sequence(
@@ -618,10 +1047,28 @@ def _play_state_sequence(
     print(colored("Playback finished.", "green"))
 
 
-def _record_preview_video(env, video_path: str):
+def _record_preview_video(
+    env,
+    video_path: str,
+    *,
+    home_preset: Path | str | None = None,
+    layout: int | None = None,
+    style: int | None = None,
+    seed: int | None = None,
+    source_fixture: str = "counter",
+    target_fixture: str = "stove",
+):
     env.reset()
     cam_config = _compute_preview_cam_config(env)
-    states = _generate_preview_states(env)
+    states, _, _ = _generate_preview_states(
+        env,
+        home_preset=home_preset,
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture=source_fixture,
+        target_fixture=target_fixture,
+    )
     writer = imageio.get_writer(video_path, fps=PREVIEW_FPS)
     _play_state_sequence(env, states, video_writer=writer, cam_config=cam_config)
     writer.close()
@@ -630,7 +1077,7 @@ def _record_preview_video(env, video_path: str):
 
 def play_move_pan_live(
     source_fixture: str = "counter",
-    target_fixture: str = "sink",
+    target_fixture: str = "stove",
     obj_registries: str | tuple[str, ...] = "coppelia_edu",
     teleop: bool = False,
     render_offscreen: bool = False,
@@ -639,6 +1086,7 @@ def play_move_pan_live(
     style: int | None = None,
     seed: int = 0,
     device: str = "keyboard",
+    home_preset: Path | str | None = None,
 ):
     """Run one MovePan live session: preview (default) or teleop."""
     if isinstance(obj_registries, str):
@@ -674,12 +1122,29 @@ def play_move_pan_live(
         return
 
     if render_offscreen and video_path:
-        _record_preview_video(env, video_path)
+        _record_preview_video(
+            env,
+            video_path,
+            home_preset=home_preset,
+            layout=layout,
+            style=style,
+            seed=seed,
+            source_fixture=source_fixture,
+            target_fixture=target_fixture,
+        )
         return
 
     env.reset()
     cam_config = _compute_preview_cam_config(env)
-    states = _generate_preview_states(env)
+    states, _, _ = _generate_preview_states(
+        env,
+        home_preset=home_preset,
+        layout=layout,
+        style=style,
+        seed=seed,
+        source_fixture=source_fixture,
+        target_fixture=target_fixture,
+    )
     reset_to(env, {"states": states[0]})
 
     if pygame_viewer is not None:

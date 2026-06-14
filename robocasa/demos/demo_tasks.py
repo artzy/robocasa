@@ -98,8 +98,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--target-fixture",
         type=str,
-        default="sink",
-        help="MovePan target fixture",
+        default="stove",
+        help="MovePan target fixture (default: stove)",
     )
     parser.add_argument(
         "--obj-registries",
@@ -114,6 +114,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--layout", type=int, default=None, help="MovePan kitchen layout id")
     parser.add_argument("--style", type=int, default=None, help="MovePan kitchen style id")
+    parser.add_argument(
+        "--home-preset",
+        type=str,
+        default="robocasa/demos/move_pan_home_presets/default_layout15_seed0.json",
+        help="MovePan: JSON home pose preset (base + EEF)",
+    )
     args = parser.parse_args()
 
     all_tasks = OrderedDict(
@@ -191,6 +197,7 @@ if __name__ == "__main__":
                 video_path=video_path,
                 layout=args.layout,
                 style=args.style,
+                home_preset=args.home_preset,
             )
             if args.task is not None:
                 break
